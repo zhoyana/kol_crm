@@ -1,13 +1,13 @@
 import Link from "next/link";
-import { getRuleProfiles } from "@/lib/agent-store";
 import { getCampaignTasks } from "@/lib/campaign-tasks";
+import { getCampaignTaskSummaries } from "@/lib/agent-workbench";
 import { AgentClient } from "./AgentClient";
 
 export const dynamic = "force-dynamic";
 
 export default async function AgentPage() {
-  const profiles = await getRuleProfiles();
   const campaignTasks = await getCampaignTasks();
+  const summaries = await getCampaignTaskSummaries(campaignTasks.map((task) => task.id));
 
   return (
     <main className="shell">
@@ -24,7 +24,7 @@ export default async function AgentPage() {
           <Link href="/review">达人复筛</Link>
           <Link href="/creators">达人库</Link>
           <Link className="active" href="/agent">
-            筛选 Agent
+            Agent 工作台
           </Link>
           <Link href="/tasks">建联任务</Link>
           <Link href="/import">导入 CSV</Link>
@@ -35,15 +35,15 @@ export default async function AgentPage() {
       <section className="content">
         <header className="topbar">
           <div>
-            <h1>筛选 Agent</h1>
-            <p>把你的筛选目标转成可保存、可复用、后续可学习的规则模板。</p>
+            <h1>Agent 工作台</h1>
+            <p>把不同品类拆成任务，让发现、复筛、达人库和建联都围绕同一个目标运转。</p>
           </div>
           <Link className="button-link" href="/discover">
             去达人发现
           </Link>
         </header>
 
-        <AgentClient initialProfiles={profiles} initialCampaignTasks={campaignTasks} />
+        <AgentClient initialCampaignTasks={campaignTasks} initialSummaries={summaries} />
       </section>
     </main>
   );

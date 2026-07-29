@@ -7,6 +7,12 @@ type MiniPrismaClient = {
     findFirst: (args: Record<string, unknown>) => Promise<any | null>;
     update: (args: Record<string, unknown>) => Promise<any>;
   };
+  campaignTask: {
+    findUnique: (args: Record<string, unknown>) => Promise<any | null>;
+  };
+  creatorCampaignTask: {
+    upsert: (args: Record<string, unknown>) => Promise<any>;
+  };
   $disconnect: () => Promise<void>;
 };
 
@@ -80,6 +86,60 @@ function toReviewCandidate(row: any): DouyinDiscoveryCandidate {
   };
 }
 
+function normalizeCampaignTaskId(value: unknown): number | null {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return id;
+}
+
+function toHomepageCampaignTask(task: any): HomepageReviewRules["campaignTask"] | undefined {
+  if (!task) return undefined;
+  return {
+    name: task.name || "",
+    productName: task.productName || "",
+    category: task.category || null,
+    targetAudience: task.targetAudience || "",
+    targetDescription: task.targetDescription || "",
+    seedKeywords: Array.isArray(task.seedKeywords) ? task.seedKeywords : [],
+    excludeKeywords: Array.isArray(task.excludeKeywords) ? task.excludeKeywords : [],
+    productSellingPoints: Array.isArray(task.productSellingPoints) ? task.productSellingPoints : [],
+    outreachTone: task.outreachTone || null
+  };
+}
+
+async function writeCampaignReviewResult(prisma: MiniPrismaClient, creatorId: number, campaignTaskId: number | null, result: {
+  poolStatus: string;
+  screeningStatus: string;
+  screeningSummary?: string | null;
+  notes?: string | null;
+}) {
+  if (!campaignTaskId) return;
+
+  await prisma.creatorCampaignTask.upsert({
+    where: {
+      creatorId_campaignTaskId: {
+        creatorId,
+        campaignTaskId
+      }
+    },
+    update: {
+      poolStatus: result.poolStatus,
+      screeningStatus: result.screeningStatus,
+      screeningSummary: result.screeningSummary || null,
+      notes: result.notes || null
+    },
+    create: {
+      creatorId,
+      campaignTaskId,
+      poolStatus: result.poolStatus,
+      screeningStatus: result.screeningStatus,
+      fitScore: 0,
+      screeningSummary: result.screeningSummary || null,
+      notes: result.notes || null
+    }
+  });
+}
+
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "还没有配置 DATABASE_URL，请先连接 MySQL。" }, { status: 400 });
@@ -91,11 +151,19 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     workLimit?: number;
     allowFullRetry?: boolean;
     skipObviousMismatch?: boolean;
+    campaignTaskId?: number | string | null;
   } | null;
   const numericId = Number(id);
+  const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
   const prisma = await getPrisma();
 
   try {
+    const campaignTask = campaignTaskId
+      ? await prisma.campaignTask.findUnique({
+          where: { id: campaignTaskId }
+        })
+      : null;
+    const rules = { ...(body?.rules || {}), campaignTask: toHomepageCampaignTask(campaignTask) };
     const creator = await prisma.creator.findFirst({
       where: {
         OR: [{ externalId: id }, ...(Number.isInteger(numericId) ? [{ id: numericId }] : [])]
@@ -112,7 +180,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       return NextResponse.json({ error: "没有找到这个待复筛达人。" }, { status: 404 });
     }
 
-    const result = await verifyDouyinHomepageCandidateFast(toReviewCandidate(creator), body?.rules, {
+    const result = await verifyDouyinHomepageCandidateFast(toReviewCandidate(creator), rules, {
       workLimit: body?.workLimit || 6,
       allowFullRetry: body?.allowFullRetry ?? true,
       skipObviousMismatch: body?.skipObviousMismatch ?? true
@@ -126,12 +194,24 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
           screeningSummary: result.reason
         }
       });
+      await writeCampaignReviewResult(prisma, creator.id, campaignTaskId, {
+        poolStatus: "skipped",
+        screeningStatus: "inactive_or_failed",
+        screeningSummary: result.reason
+      });
       return NextResponse.json({ ok: false, skipped: true, message: result.reason });
     }
 
     await importDouyinCandidates([result.candidate]);
+    await writeCampaignReviewResult(prisma, creator.id, campaignTaskId, {
+      poolStatus: result.candidate.poolStatus,
+      screeningStatus: result.candidate.screeningStatus,
+      screeningSummary: result.candidate.screeningSummary,
+      notes: result.candidate.notes
+    });
     return NextResponse.json({
       ok: true,
+      campaignTaskId,
       poolStatus: result.candidate.poolStatus,
       screeningStatus: result.candidate.screeningStatus,
       screeningSummary: result.candidate.screeningSummary

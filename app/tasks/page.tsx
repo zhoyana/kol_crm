@@ -1,6 +1,11 @@
 import Link from "next/link";
+import { getCampaignTasks } from "@/lib/campaign-tasks";
 import { formatNumber, generateOutreachScript, getCreators, getOutreachTasks } from "@/lib/creators";
 import { TaskActions } from "./TaskActions";
+import { TaskCampaignPicker } from "./TaskCampaignPicker";
+import { BatchOutreachPanel } from "./BatchOutreachPanel";
+
+export const dynamic = "force-dynamic";
 
 const taskLabel = {
   initial: "初次建联",
@@ -14,12 +19,23 @@ const priorityLabel = {
   low: "暂缓"
 };
 
-export default async function TasksPage() {
-  const creators = await getCreators();
+export default async function TasksPage({ searchParams }: { searchParams?: Promise<{ campaignTaskId?: string }> }) {
+  const params = await searchParams;
+  const campaignTaskId = Number(params?.campaignTaskId || 0) || null;
+  const [campaignTasks, creators] = await Promise.all([getCampaignTasks(), getCreators(campaignTaskId)]);
+  const selectedCampaignTask = campaignTasks.find((task) => task.id === campaignTaskId) || null;
   const tasks = getOutreachTasks(creators);
   const initialTasks = tasks.filter((task) => task.kind === "initial");
   const negotiateTasks = tasks.filter((task) => task.kind === "negotiate");
   const followupTasks = tasks.filter((task) => task.kind === "followup");
+  const creatorsLink = campaignTaskId ? `/creators?campaignTaskId=${campaignTaskId}` : "/creators";
+  const batchCandidates = initialTasks.map((task) => ({
+    creatorId: task.creator.id,
+    creatorName: task.creator.name,
+    profileUrl: task.creator.profileUrl,
+    taskKind: task.kind,
+    defaultScript: generateOutreachScript(task.creator)
+  }));
 
   return (
     <main className="shell">
@@ -35,6 +51,7 @@ export default async function TasksPage() {
           <Link href="/agent">筛选 Agent</Link>
           <Link href="/discover">达人发现</Link>
           <Link href="/">仪表盘</Link>
+          <Link href="/review">达人复筛</Link>
           <Link href="/creators">达人库</Link>
           <a className="active">建联任务</a>
           <Link href="/import">导入 CSV</Link>
@@ -47,12 +64,15 @@ export default async function TasksPage() {
         <header className="topbar">
           <div>
             <h1>建联任务</h1>
-            <p>把待联系、待谈价、待跟进的达人拆成今天能执行的清单。</p>
+            <p>按品类任务从精选库生成今天可执行的建联清单，复制话术后人工确认发送。</p>
           </div>
-          <Link className="button-link" href="/creators">
+          <Link className="button-link" href={creatorsLink}>
             回到达人库
           </Link>
         </header>
+
+        <TaskCampaignPicker campaignTasks={campaignTasks} selectedCampaignTask={selectedCampaignTask} />
+        <BatchOutreachPanel campaignTaskId={campaignTaskId} candidates={batchCandidates} />
 
         <section className="metrics">
           <div>
@@ -78,9 +98,19 @@ export default async function TasksPage() {
         </section>
 
         <section className="task-board">
-          <TaskColumn title="初次建联" description="还没有联系过，适合先发送合作意向或询价。" tasks={initialTasks} />
-          <TaskColumn title="报价谈判" description="已知报价偏高，需要用 CPM 作为谈价锚点。" tasks={negotiateTasks} />
-          <TaskColumn title="二次跟进" description="已经联系过，但合作状态还没有落定。" tasks={followupTasks} />
+          <TaskColumn
+            campaignTaskId={campaignTaskId}
+            description="还没有联系过，适合先发送品类任务下的个性化合作意向。"
+            tasks={initialTasks}
+            title="初次建联"
+          />
+          <TaskColumn
+            campaignTaskId={campaignTaskId}
+            description="已知报价偏高，需要用 CPM 和品类预算作为谈价锚点。"
+            tasks={negotiateTasks}
+            title="报价谈判"
+          />
+          <TaskColumn campaignTaskId={campaignTaskId} description="已经联系过，但合作状态还没有落定。" tasks={followupTasks} title="二次跟进" />
         </section>
       </section>
     </main>
@@ -90,11 +120,13 @@ export default async function TasksPage() {
 function TaskColumn({
   title,
   description,
-  tasks
+  tasks,
+  campaignTaskId
 }: {
   title: string;
   description: string;
   tasks: ReturnType<typeof getOutreachTasks>;
+  campaignTaskId: number | null;
 }) {
   return (
     <section className="panel task-column">
@@ -144,6 +176,7 @@ function TaskColumn({
                 <p className="task-action">{task.action}</p>
 
                 <TaskActions
+                  campaignTaskId={campaignTaskId}
                   creatorId={task.creator.id}
                   creatorName={task.creator.name}
                   profileUrl={task.creator.profileUrl}

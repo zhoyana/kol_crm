@@ -2,15 +2,18 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
+import type { CampaignTaskItem } from "@/lib/campaign-tasks";
 import type { Creator } from "@/lib/creators";
 
 type CreatorLibraryProps = {
   creators: Creator[];
+  initialCampaignTasks: CampaignTaskItem[];
+  initialCampaignTaskId: number | null;
 };
 
 const ALL = "全部";
 
-const gradeLabel = {
+const gradeLabel: Record<string, string> = {
   S: "S级",
   A: "A级",
   B: "B级",
@@ -18,7 +21,7 @@ const gradeLabel = {
   D: "D级"
 };
 
-const priorityLabel = {
+const priorityLabel: Record<string, string> = {
   high: "优先",
   medium: "观察",
   low: "暂缓"
@@ -40,11 +43,19 @@ const poolTabs = [
 ];
 
 function formatNumber(value: number): string {
-  return new Intl.NumberFormat("zh-CN").format(value);
+  return new Intl.NumberFormat("zh-CN").format(value || 0);
 }
 
 function getPoolLabel(status: string): string {
   return poolLabel[status] || status || "未分库";
+}
+
+function getGradeLabel(grade: string): string {
+  return gradeLabel[grade] || grade || "-";
+}
+
+function getPriorityLabel(priority: string): string {
+  return priorityLabel[priority] || priority || "-";
 }
 
 function csvCell(value: string | number | null | undefined): string {
@@ -56,8 +67,10 @@ function todayText(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-export function CreatorLibrary({ creators }: CreatorLibraryProps) {
+export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaignTaskId }: CreatorLibraryProps) {
   const [items, setItems] = useState(creators);
+  const [campaignTasks] = useState(initialCampaignTasks);
+  const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
   const [keyword, setKeyword] = useState("");
   const [platform, setPlatform] = useState(ALL);
   const [status, setStatus] = useState(ALL);
@@ -70,8 +83,12 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
   const [isBatchReviewing, setIsBatchReviewing] = useState(false);
   const [error, setError] = useState("");
 
-  const platforms = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.platform)))], [items]);
-  const statuses = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.outreachStatus)))], [items]);
+  const platforms = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.platform).filter(Boolean)))], [items]);
+  const statuses = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.outreachStatus).filter(Boolean)))], [items]);
+  const selectedCampaignTask = useMemo(
+    () => campaignTasks.find((task) => String(task.id) === selectedCampaignTaskId) || null,
+    [campaignTasks, selectedCampaignTaskId]
+  );
   const poolCounts = useMemo(
     () =>
       items.reduce<Record<string, number>>(
@@ -105,8 +122,17 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
     });
   }, [grade, items, keyword, platform, poolStatus, priority, status]);
 
+  function changeCampaignTask(taskId: string) {
+    setSelectedCampaignTaskId(taskId);
+    const suffix = taskId ? `?campaignTaskId=${encodeURIComponent(taskId)}` : "";
+    window.location.href = `/creators${suffix}`;
+  }
+
   async function deleteCreator(creator: Creator) {
-    const confirmed = window.confirm(`确定删除「${creator.name}」吗？会从达人库和数据库中移除。`);
+    const message = selectedCampaignTask
+      ? `确定把「${creator.name}」从当前品类任务里移除吗？不会删除其他品类里的记录。`
+      : `确定删除「${creator.name}」吗？会从达人库和数据库中移除。`;
+    const confirmed = window.confirm(message);
     if (!confirmed) return;
 
     setDeletingId(creator.id);
@@ -116,7 +142,10 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
       const response = await fetch(`/api/creators/${encodeURIComponent(creator.id)}/delete`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: "人工删除：不符合达人筛选目标" })
+        body: JSON.stringify({
+          reason: "Manual delete: not a fit for current creator screening target.",
+          campaignTaskId: selectedCampaignTaskId || null
+        })
       });
       const data = await response.json().catch(() => ({}));
 
@@ -141,7 +170,10 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
       const response = await fetch(`/api/creators/${encodeURIComponent(creator.id)}/review`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: "人工加入复筛：后续条件可能变化，需要重新判断主页作品" })
+        body: JSON.stringify({
+          reason: "Manual send to review: rules or human judgment changed.",
+          campaignTaskId: selectedCampaignTaskId || null
+        })
       });
       const data = await response.json().catch(() => ({}));
 
@@ -183,7 +215,8 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
         body: JSON.stringify({
           poolStatus: "candidate",
           screeningStatus: "manual_downgraded",
-          reason: "人工核检：暂不符合精选标准，移入待选库继续观察"
+          reason: "Manual audit: move from featured to candidate for continued observation.",
+          campaignTaskId: selectedCampaignTaskId || null
         })
       });
       const data = await response.json().catch(() => ({}));
@@ -231,7 +264,8 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ids: targets.map((creator) => creator.id),
-          reason: "批量加入复筛：规则或人工判断发生变化，需要重新判断主页作品"
+          reason: "Batch send to review: rules or human judgment changed.",
+          campaignTaskId: selectedCampaignTaskId || null
         })
       });
       const data = await response.json().catch(() => ({}));
@@ -297,8 +331,8 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
       creator.quote ?? "",
       creator.currentCpm ?? "",
       creator.suggestedPrice,
-      gradeLabel[creator.grade],
-      priorityLabel[creator.priority],
+      getGradeLabel(creator.grade),
+      getPriorityLabel(creator.priority),
       creator.outreachStatus,
       creator.screeningStatus,
       creator.screeningSummary,
@@ -318,6 +352,43 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
 
   return (
     <>
+      <section className="panel campaign-task-picker">
+        <div>
+          <h2>品类任务视图</h2>
+          <p>选择任务后，库类型会优先显示这个任务下的状态；不选任务则查看全局达人库。</p>
+        </div>
+        <div className="campaign-task-picker-controls">
+          <select onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+            <option value="">全局达人库</option>
+            {campaignTasks.map((task) => (
+              <option key={task.id} value={task.id}>
+                {task.name}
+              </option>
+            ))}
+          </select>
+          <Link className="secondary-link" href="/agent">
+            管理品类任务
+          </Link>
+        </div>
+        {selectedCampaignTask ? (
+          <div className="campaign-task-summary">
+            <div>
+              <span>推广产品</span>
+              <strong>{selectedCampaignTask.productName}</strong>
+            </div>
+            <div>
+              <span>目标人群</span>
+              <strong>{selectedCampaignTask.targetAudience}</strong>
+            </div>
+            <div>
+              <span>当前达人</span>
+              <strong>{items.length} 个</strong>
+            </div>
+            <p>{selectedCampaignTask.targetDescription}</p>
+          </div>
+        ) : null}
+      </section>
+
       <section className="panel">
         <div className="panel-header">
           <div>
@@ -373,7 +444,7 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
           评级
           <select onChange={(event) => setGrade(event.target.value)} value={grade}>
             {[ALL, "S", "A", "B", "C", "D"].map((item) => (
-              <option key={item}>{item === ALL ? item : gradeLabel[item as keyof typeof gradeLabel]}</option>
+              <option key={item}>{item === ALL ? item : getGradeLabel(item)}</option>
             ))}
           </select>
         </label>
@@ -439,10 +510,10 @@ export function CreatorLibrary({ creators }: CreatorLibraryProps) {
                   <td className={creator.currentCpm && creator.currentCpm > 20 ? "danger" : ""}>{creator.currentCpm ?? "-"}</td>
                   <td>¥{formatNumber(creator.suggestedPrice)}</td>
                   <td>
-                    <span className={`grade grade-${creator.grade.toLowerCase()}`}>{gradeLabel[creator.grade]}</span>
+                    <span className={`grade grade-${creator.grade.toLowerCase()}`}>{getGradeLabel(creator.grade)}</span>
                   </td>
                   <td>
-                    <span className={`priority ${creator.priority}`}>{priorityLabel[creator.priority]}</span>
+                    <span className={`priority ${creator.priority}`}>{getPriorityLabel(creator.priority)}</span>
                   </td>
                   <td>
                     {creator.poolStatus === "candidate" || creator.poolStatus === "skipped" ? (

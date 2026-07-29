@@ -1,13 +1,46 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { TopicCandidate } from "@/lib/crawler-tasks";
+import {
+  resolveDiscoveryRuleTemplate,
+  type DiscoveryCampaignTask,
+  type DiscoveryRuleTemplate
+} from "@/lib/discovery-rule-templates";
 
 type TopicRulesRequest = {
   keyword?: string;
+  campaignTaskId?: number | string | null;
   topics?: TopicCandidate[];
   primaryTerms?: string[];
   supportTerms?: string[];
   excludeTerms?: string[];
 };
+
+function normalizeTaskId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+async function loadCampaignTask(id: number | null): Promise<DiscoveryCampaignTask | null> {
+  if (!id || !process.env.DATABASE_URL) return null;
+  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
+  const PrismaClient = prismaModule.PrismaClient as new () => any;
+  const prisma = new PrismaClient();
+  try {
+    return await prisma.campaignTask.findUnique({ where: { id } });
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+function applyTemplateRules(template: DiscoveryRuleTemplate, result: TopicRulesResult): TopicRulesResult {
+  return {
+    ...result,
+    primaryTerms: uniqueTerms([...template.discovery.primaryTerms, ...result.primaryTerms]).slice(0, 24),
+    supportTerms: uniqueTerms([...template.discovery.supportTerms, ...result.supportTerms]).slice(0, 30),
+    excludeTerms: uniqueTerms([...template.discovery.excludeTerms, ...result.excludeTerms]).slice(0, 40),
+    note: [result.note, `已应用${template.name} v${template.version}`].filter(Boolean).join(" ")
+  };
+}
 
 type TopicRulesResult = {
   keep: string[];
@@ -134,11 +167,17 @@ function buildPrompt(input: {
   primaryTerms: string[];
   supportTerms: string[];
   excludeTerms: string[];
+  template: DiscoveryRuleTemplate;
 }): string {
   const hasTopics = input.topics.length > 0;
 
   return [
     "你是达人营销项目里的检索规则设计师。",
+    `当前达人发现规则模板：${input.template.name} v${input.template.version}`,
+    `模板强相关词：${input.template.discovery.primaryTerms.join("、") || "-"}`,
+    `模板辅助词：${input.template.discovery.supportTerms.join("、") || "-"}`,
+    `模板排除词：${input.template.discovery.excludeTerms.join("、") || "-"}`,
+    ...input.template.candidateScreen.instructions,
     "业务目标：寻找适合警察日常通勤衣服、警察小熊、公安/警校日常内容合作的真实个人达人。",
     "核心不是找所有警察相关内容，而是找适合带货/建联的个人内容创作者。",
     "强相关词必须是高意图短语，不能只写“警察、公安、警校、警员、民警”这种泛词。",
@@ -189,12 +228,15 @@ export async function POST(request: NextRequest) {
     source: topic.source
   }));
 
+  const campaignTask = await loadCampaignTask(normalizeTaskId(body?.campaignTaskId));
+  const template = resolveDiscoveryRuleTemplate(campaignTask);
   const prompt = buildPrompt({
     keyword,
     topics,
     primaryTerms: asStringArray(body?.primaryTerms),
     supportTerms: asStringArray(body?.supportTerms),
-    excludeTerms: asStringArray(body?.excludeTerms)
+    excludeTerms: asStringArray(body?.excludeTerms),
+    template
   });
 
   try {
@@ -222,7 +264,7 @@ export async function POST(request: NextRequest) {
 
     const content = String(data?.choices?.[0]?.message?.content || "");
     const parsed = safeJsonParse(content);
-    const result = refinePoliceRules(keyword, {
+    const result = applyTemplateRules(template, {
       keep: asStringArray(parsed.keep),
       maybe: asStringArray(parsed.maybe),
       drop: asStringArray(parsed.drop),

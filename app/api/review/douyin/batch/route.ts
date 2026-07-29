@@ -7,6 +7,12 @@ type MiniPrismaClient = {
     findMany: (args: Record<string, unknown>) => Promise<any[]>;
     update: (args: Record<string, unknown>) => Promise<any>;
   };
+  campaignTask: {
+    findUnique: (args: Record<string, unknown>) => Promise<any | null>;
+  };
+  creatorCampaignTask: {
+    upsert: (args: Record<string, unknown>) => Promise<any>;
+  };
   $disconnect: () => Promise<void>;
 };
 
@@ -100,6 +106,60 @@ function idFilters(ids: string[]): Record<string, unknown>[] {
   });
 }
 
+function normalizeCampaignTaskId(value: unknown): number | null {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return id;
+}
+
+function toHomepageCampaignTask(task: any): HomepageReviewRules["campaignTask"] | undefined {
+  if (!task) return undefined;
+  return {
+    name: task.name || "",
+    productName: task.productName || "",
+    category: task.category || null,
+    targetAudience: task.targetAudience || "",
+    targetDescription: task.targetDescription || "",
+    seedKeywords: Array.isArray(task.seedKeywords) ? task.seedKeywords : [],
+    excludeKeywords: Array.isArray(task.excludeKeywords) ? task.excludeKeywords : [],
+    productSellingPoints: Array.isArray(task.productSellingPoints) ? task.productSellingPoints : [],
+    outreachTone: task.outreachTone || null
+  };
+}
+
+async function writeCampaignReviewResult(prisma: MiniPrismaClient, creatorId: number, campaignTaskId: number | null, result: {
+  poolStatus: string;
+  screeningStatus: string;
+  screeningSummary?: string | null;
+  notes?: string | null;
+}) {
+  if (!campaignTaskId) return;
+
+  await prisma.creatorCampaignTask.upsert({
+    where: {
+      creatorId_campaignTaskId: {
+        creatorId,
+        campaignTaskId
+      }
+    },
+    update: {
+      poolStatus: result.poolStatus,
+      screeningStatus: result.screeningStatus,
+      screeningSummary: result.screeningSummary || null,
+      notes: result.notes || null
+    },
+    create: {
+      creatorId,
+      campaignTaskId,
+      poolStatus: result.poolStatus,
+      screeningStatus: result.screeningStatus,
+      fitScore: 0,
+      screeningSummary: result.screeningSummary || null,
+      notes: result.notes || null
+    }
+  });
+}
+
 export async function POST(request: NextRequest) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "还没有配置 DATABASE_URL，请先连接 MySQL。" }, { status: 400 });
@@ -111,8 +171,9 @@ export async function POST(request: NextRequest) {
     workLimit?: number;
     allowFullRetry?: boolean;
     skipObviousMismatch?: boolean;
+    campaignTaskId?: number | string | null;
   } | null;
-  const ids = (body?.ids || []).map((id) => String(id).trim()).filter(Boolean).slice(0, 10);
+  const ids = (body?.ids || []).map((id) => String(id).trim()).filter(Boolean).slice(0, 30);
   if (!ids.length) {
     return NextResponse.json({ error: "请选择要批量复筛的达人。" }, { status: 400 });
   }
@@ -120,6 +181,13 @@ export async function POST(request: NextRequest) {
   const prisma = await getPrisma();
 
   try {
+    const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
+    const campaignTask = campaignTaskId
+      ? await prisma.campaignTask.findUnique({
+          where: { id: campaignTaskId }
+        })
+      : null;
+    const rules = { ...(body?.rules || {}), campaignTask: toHomepageCampaignTask(campaignTask) };
     const rows = await prisma.creator.findMany({
       where: { OR: idFilters(ids) },
       include: {
@@ -135,7 +203,7 @@ export async function POST(request: NextRequest) {
     }
 
     const candidates = rows.map(toReviewCandidate);
-    const reviewResults = await verifyDouyinHomepageCandidatesBatch(candidates, body?.rules, {
+    const reviewResults = await verifyDouyinHomepageCandidatesBatch(candidates, rules, {
       workLimit: body?.workLimit || 3,
       allowFullRetry: body?.allowFullRetry ?? true,
       skipObviousMismatch: body?.skipObviousMismatch ?? true
@@ -161,10 +229,21 @@ export async function POST(request: NextRequest) {
             screeningSummary: result.reason
           }
         });
+        await writeCampaignReviewResult(prisma, row.id, campaignTaskId, {
+          poolStatus: "skipped",
+          screeningStatus: "inactive_or_failed",
+          screeningSummary: result.reason
+        });
         results.push({ id: row.id, externalId, name: row.name, ok: false, skipped: true, message: result.reason });
         continue;
       }
 
+      await writeCampaignReviewResult(prisma, row.id, campaignTaskId, {
+        poolStatus: result.candidate.poolStatus,
+        screeningStatus: result.candidate.screeningStatus,
+        screeningSummary: result.candidate.screeningSummary,
+        notes: result.candidate.notes
+      });
       results.push({
         id: row.id,
         externalId,

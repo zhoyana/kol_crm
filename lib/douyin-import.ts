@@ -519,6 +519,15 @@ function latestDate(works: DouyinWork[]): string | null {
 
 function guessAccountType(name: string, notes?: string | null): { accountType: string; rejectReason: string | null } {
   const text = `${name} ${notes || ""}`;
+  if (/护考小技巧|考公考编|护考培训|护考资料|全套网课|护考课程|护士资格证.{0,8}(培训|课程)|护士招聘考试|报考咨询/i.test(text)) {
+    return { accountType: "education_training", rejectReason: "exam_training_or_career_guidance_account" };
+  }
+  if (/账号运营|账号孵化|代运营|短视频运营|短视频服务|医生ip|医疗ip|爆款形式|热门形式|运营培训|运营咨询/i.test(text)) {
+    return { accountType: "marketing_agency", rejectReason: "marketing_or_incubation_account" };
+  }
+  if (/主任医师|副主任医师|主治医师|主任医生|医学专家|公立三甲|三甲医院|医院.{0,8}主任|医学会|委员会.{0,8}委员/i.test(text)) {
+    return { accountType: "professional_verified", rejectReason: "professional_authority_account" };
+  }
   const rules: Array<[string, string, RegExp]> = [
     ["official", "official_account", /官方|官号|认证|蓝v|蓝V|企业认证|官方认证/i],
     ["brand", "brand_account", /旗舰店|品牌|专卖店|旗舰号|官方旗舰/i],
@@ -536,6 +545,7 @@ function guessAccountType(name: string, notes?: string | null): { accountType: s
 }
 
 function creatorVerifyText(item: Record<string, unknown>): string {
+  const verificationType = String(item.creator_verification_type || "").trim();
   const enterpriseText = [
     item.creator_custom_verify,
     item.creator_enterprise_verify_reason,
@@ -548,7 +558,7 @@ function creatorVerifyText(item: Record<string, unknown>): string {
   return [
     hasEnterpriseSignal ? "蓝V 企业认证 官方认证" : "",
     item.creator_signature,
-    item.creator_verification_type,
+    verificationType ? `verification_type:${verificationType}` : "",
     item.creator_custom_verify,
     item.creator_enterprise_verify_reason,
     item.creator_is_enterprise_verify
@@ -642,7 +652,7 @@ function toDiscoveryCandidate(item: Record<string, unknown>, category: string): 
     platform: "抖音",
     profileUrl: profileUrl || null,
     category: category || sourceKeyword || "未分类",
-    fans: 0,
+    fans: numberValue(String(item.creator_follower_count || item.follower_count || item.fans || "")),
     quote: null,
     outreachStatus: "未建联",
     cooperationStatus: null,
@@ -1106,6 +1116,7 @@ export async function searchDouyinResultFilesByTask(input: {
             if (startedAtMs && lastModifyTs && lastModifyTs < startedAtMs) return false;
             if (allowedKeywords.length && !sourceKeyword) return false;
             if (allowedKeywords.length && sourceKeyword && !allowedKeywords.includes(sourceKeyword)) return false;
+            if (sourceKeyword && allowedKeywords.includes(sourceKeyword)) return true;
             if (!rawItemMatchesDiscoveryIntent(item, input.keyword)) return false;
             return true;
           } catch {
@@ -1200,3 +1211,4 @@ export async function searchDouyinCandidatesFromWorkPool(keyword: string): Promi
     await prisma.$disconnect();
   }
 }
+

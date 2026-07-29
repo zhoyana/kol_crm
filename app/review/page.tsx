@@ -1,11 +1,14 @@
 import Link from "next/link";
+import { getCampaignTasks } from "@/lib/campaign-tasks";
 import { getPendingReviewCreators } from "@/lib/review";
 import { ReviewClient } from "./ReviewClient";
 
 export const dynamic = "force-dynamic";
 
-export default async function ReviewPage() {
-  const creators = await getPendingReviewCreators();
+export default async function ReviewPage({ searchParams }: { searchParams?: Promise<{ campaignTaskId?: string }> }) {
+  const params = await searchParams;
+  const campaignTaskId = Number(params?.campaignTaskId || 0) || null;
+  const [creators, campaignTasks] = await Promise.all([getPendingReviewCreators(campaignTaskId), getCampaignTasks()]);
 
   return (
     <main className="shell">
@@ -43,7 +46,7 @@ export default async function ReviewPage() {
           </Link>
         </header>
 
-        <ReviewClient initialCreators={creators} />
+        <ReviewClient initialCampaignTaskId={campaignTaskId} initialCampaignTasks={campaignTasks} initialCreators={creators} />
       </section>
     </main>
   );

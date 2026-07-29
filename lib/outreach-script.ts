@@ -3,10 +3,24 @@ import { buildShushujiaOutreachGuide } from "./brand-outreach-style";
 
 export type AiProvider = "default" | "openai";
 
+export type OutreachCampaignTask = {
+  id?: number;
+  name?: string;
+  productName?: string;
+  category?: string;
+  targetAudience?: string;
+  targetDescription?: string;
+  seedKeywords?: string[];
+  excludeKeywords?: string[];
+  productSellingPoints?: string[];
+  outreachTone?: string | null;
+};
+
 export type OutreachScriptInput = {
   creator: Creator;
   taskKind?: "initial" | "followup" | "negotiate";
   provider?: AiProvider;
+  campaignTask?: OutreachCampaignTask | null;
   works?: Array<{
     title?: string | null;
     likeCount?: number | null;
@@ -58,7 +72,7 @@ function cleanText(value: unknown): string {
 }
 
 function formatNumber(value: number): string {
-  return new Intl.NumberFormat("zh-CN").format(value);
+  return new Intl.NumberFormat("zh-CN").format(value || 0);
 }
 
 function safeJsonObject(value: string): Record<string, unknown> | null {
@@ -79,6 +93,11 @@ function safeJsonObject(value: string): Record<string, unknown> | null {
   }
 }
 
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
+}
+
 function taskKindText(kind: OutreachScriptInput["taskKind"]): string {
   if (kind === "followup") return "二次跟进";
   if (kind === "negotiate") return "报价谈判";
@@ -96,10 +115,9 @@ function poolStatusText(status: string): string {
 
 function pickSummaryLines(summary: string): string[] {
   return cleanText(summary)
-    .split(/[；;\n]/)
+    .split(/[；\n]/)
     .map((line) => cleanText(line))
     .filter(Boolean)
-    .filter((line) => /AI|画像|复筛|精选|待选|爆款|平均点赞|近1个月|作品数|警校|训练|宿舍|毕业|vlog|日常|非精选|跳过|排除/.test(line))
     .slice(0, 8);
 }
 
@@ -112,7 +130,7 @@ function topWorks(input: OutreachScriptInput) {
     }))
     .filter((work) => work.title)
     .sort((a, b) => b.likeCount - a.likeCount)
-    .slice(0, 6);
+    .slice(0, 8);
 }
 
 function inferPersonalAnchors(input: OutreachScriptInput): string[] {
@@ -128,9 +146,22 @@ function inferPersonalAnchors(input: OutreachScriptInput): string[] {
   if (/穿搭|制服|警服|ootd|通勤/.test(text)) add("制服/通勤穿搭");
   if (/小熊|玩偶|周边|挂件|桌面/.test(text)) add("小熊周边");
   if (/健身|腹肌|体能/.test(text)) add("体能/健身生活");
-  if (/招生|报考|升学|联考|法考|法学生|官方|媒体|新闻|科普/.test(text)) add("需要谨慎确认的账号属性");
 
   return anchors.length ? anchors.slice(0, 4) : ["主页内容风格"];
+}
+
+function buildTaskContext(task?: OutreachCampaignTask | null) {
+  return {
+    name: task?.name || "未选择品类任务",
+    productName: task?.productName || "【产品名】",
+    category: task?.category || "",
+    targetAudience: task?.targetAudience || "",
+    targetDescription: task?.targetDescription || "",
+    seedKeywords: asStringArray(task?.seedKeywords),
+    excludeKeywords: asStringArray(task?.excludeKeywords),
+    productSellingPoints: asStringArray(task?.productSellingPoints),
+    outreachTone: task?.outreachTone || "自然、真诚、像正常私信，不要太商务，不要一上来强报价。"
+  };
 }
 
 function buildCreatorPortrait(input: OutreachScriptInput): string {
@@ -143,7 +174,7 @@ function buildCreatorPortrait(input: OutreachScriptInput): string {
     `数据：粉丝 ${formatNumber(creator.fans)}，稳定播放 ${formatNumber(creator.stablePlay)}，建议报价 ¥${formatNumber(creator.suggestedPrice)}，评级 ${creator.grade}`,
     summaryLines.length ? `复筛画像：${summaryLines.join("；")}` : "",
     creator.notes ? `备注：${cleanText(creator.notes)}` : "",
-    works.length ? `可参考作品：${works.map((work, index) => `${index + 1}. ${work.title}（点赞 ${formatNumber(work.likeCount)}）`).join("；")}` : "",
+    works.length ? `参考作品：${works.map((work, index) => `${index + 1}. ${work.title}（点赞 ${formatNumber(work.likeCount)}）`).join("；")}` : "",
     `可用切入点：${inferPersonalAnchors(input).join("、")}`
   ]
     .filter(Boolean)
@@ -181,16 +212,19 @@ export async function generateAiOutreachScript(input: OutreachScriptInput): Prom
   const config = getApiConfig(provider);
   if (!config) return fallbackOutreachScript(input);
 
-  const productName = "警察小熊周边";
+  const taskContext = buildTaskContext(input.campaignTask);
   const payload = {
     taskKind: taskKindText(input.taskKind),
     brand: {
       name: "蜀黍家",
-      product: productName,
-      targetAudience: "在校警校生、警校生活内容创作者、适合警察小熊或相关周边自然植入的个人账号",
-      productContext: "产品偏警校身份记忆、宿舍桌面、训练包挂件、毕业纪念、日常小礼物，不适合官方号、媒体号、纯科普号和已从业警察工作号。"
+      product: taskContext.productName,
+      targetAudience: taskContext.targetAudience,
+      targetDescription: taskContext.targetDescription,
+      sellingPoints: taskContext.productSellingPoints,
+      outreachTone: taskContext.outreachTone
     },
-    styleGuide: buildShushujiaOutreachGuide(productName),
+    taskContext,
+    styleGuide: buildShushujiaOutreachGuide(taskContext.productName),
     creatorPortrait: buildCreatorPortrait(input),
     personalAnchors: inferPersonalAnchors(input),
     recentWorks: topWorks(input)
@@ -217,13 +251,14 @@ export async function generateAiOutreachScript(input: OutreachScriptInput): Prom
             content: [
               "请为下面这个达人生成一条个性化建联私信。",
               "硬性要求：",
-              "1. script 控制在 45-95 字，短、自然、像抖音/小红书/微信私信。",
-              "2. 必须从 personalAnchors 或 recentWorks 里选 1 个具体点轻轻带一下，不要写成群发模板。",
+              "1. script 控制在 45-110 字，短、自然、像抖音/小红书/微信私信。",
+              "2. 必须结合 personalAnchors 或 recentWorks 里的 1 个具体点轻轻带一下，不要写成群发模板。",
               "3. 必须沿用蜀黍家的基础话术风格：宝子、小宝、活动、产品、感兴趣、方便聊聊，但不要照抄示例。",
-              "4. 产品名可自然出现为“警察小熊”“警察小熊周边”，不要讲太多产品卖点。",
-              "5. 不要写：不是广告、共创优质内容、非常契合、期待您的回复、内容数据还不错。",
-              "6. 不确定身份时不要断言“你是警校生”，改成“刷到你分享过警校/训练/校园相关内容”。",
-              "7. 结尾用轻问句，比如：有兴趣了解一下嘛、方便聊聊吗、宝看有兴趣一起参与吗。",
+              "4. 产品名优先使用当前品类任务里的 productName，不要自己乱编品类。",
+              "5. 如果任务里有 outreachTone，必须遵守它。",
+              "6. 不要写：不是广告、共创优质内容、非常契合、期待您的回复、内容数据还不错。",
+              "7. 不确定达人身份时，不要断言身份，改成“刷到你分享过相关内容”。",
+              "8. 结尾用轻问句，比如：有兴趣了解一下嘛、方便聊聊吗、宝看有兴趣一起参与吗。",
               `输入数据：${JSON.stringify(payload, null, 2)}`
             ].join("\n")
           }

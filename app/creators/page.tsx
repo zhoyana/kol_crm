@@ -1,9 +1,14 @@
 import Link from "next/link";
+import { getCampaignTasks } from "@/lib/campaign-tasks";
 import { getCreators } from "@/lib/creators";
 import { CreatorLibrary } from "./CreatorLibrary";
 
-export default async function CreatorsPage() {
-  const creators = await getCreators();
+export const dynamic = "force-dynamic";
+
+export default async function CreatorsPage({ searchParams }: { searchParams?: Promise<{ campaignTaskId?: string }> }) {
+  const params = await searchParams;
+  const campaignTaskId = Number(params?.campaignTaskId || 0) || null;
+  const [creators, campaignTasks] = await Promise.all([getCreators(campaignTaskId), getCampaignTasks()]);
   const pendingReview = creators.filter((creator) => creator.poolStatus === "pending_review").length;
   const candidate = creators.filter((creator) => creator.poolStatus === "candidate").length;
   const featured = creators.filter((creator) => creator.poolStatus === "featured").length;
@@ -65,7 +70,7 @@ export default async function CreatorsPage() {
           </div>
         </section>
 
-        <CreatorLibrary creators={creators} />
+        <CreatorLibrary creators={creators} initialCampaignTaskId={campaignTaskId} initialCampaignTasks={campaignTasks} />
       </section>
     </main>
   );

@@ -1,14 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateAiOutreachScript, type AiProvider } from "@/lib/outreach-script";
+import { generateAiOutreachScript, type AiProvider, type OutreachCampaignTask } from "@/lib/outreach-script";
 import type { Creator } from "@/lib/creators";
 
 export const runtime = "nodejs";
 
 type Body = {
   creatorId?: string;
+  campaignTaskId?: number | string | null;
   taskKind?: "initial" | "followup" | "negotiate";
   provider?: AiProvider;
 };
+
+function normalizeCampaignTaskId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
 
 function median(values: number[]): number {
   if (!values.length) return 0;
@@ -21,6 +27,11 @@ function median(values: number[]): number {
 function normalizePlays(value: unknown): number[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => Number(item || 0)).filter((item) => Number.isFinite(item) && item > 0);
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
 function gradeCreator(fans: number, stablePlay: number, currentCpm: number | null): Creator["grade"] {
@@ -39,7 +50,23 @@ function priorityFor(grade: Creator["grade"], outreachStatus: string): Creator["
   return "low";
 }
 
-function buildCreator(row: any): Creator {
+function buildCampaignTask(row: any): OutreachCampaignTask | null {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name || "",
+    productName: row.productName || "",
+    category: row.category || "",
+    targetAudience: row.targetAudience || "",
+    targetDescription: row.targetDescription || "",
+    seedKeywords: asStringArray(row.seedKeywords),
+    excludeKeywords: asStringArray(row.excludeKeywords),
+    productSellingPoints: asStringArray(row.productSellingPoints),
+    outreachTone: row.outreachTone || ""
+  };
+}
+
+function buildCreator(row: any, linkedTask?: any): Creator {
   const plays = normalizePlays(row.plays);
   const stablePlay = median(plays);
   const avgPlay = plays.length ? Math.round(plays.reduce((sum, item) => sum + item, 0) / plays.length) : 0;
@@ -51,6 +78,8 @@ function buildCreator(row: any): Creator {
 
   return {
     id: row.externalId || String(row.id),
+    campaignTaskId: linkedTask?.campaignTaskId || null,
+    campaignTaskName: linkedTask?.campaignTask?.name || "",
     name: row.name,
     platform: row.platform || "抖音",
     profileUrl: row.profileUrl || "",
@@ -59,12 +88,12 @@ function buildCreator(row: any): Creator {
     quote,
     outreachStatus,
     cooperationStatus: row.cooperationStatus || "-",
-    category: row.category || "未分类",
+    category: row.category || linkedTask?.campaignTask?.category || "未分类",
     contact: row.contact || "-",
-    notes: row.notes || "",
-    poolStatus: row.poolStatus || "candidate",
-    screeningStatus: row.screeningStatus || "",
-    screeningSummary: row.screeningSummary || "",
+    notes: linkedTask?.notes || row.notes || "",
+    poolStatus: linkedTask?.poolStatus || row.poolStatus || "candidate",
+    screeningStatus: linkedTask?.screeningStatus || row.screeningStatus || "",
+    screeningSummary: [linkedTask?.portrait, linkedTask?.screeningSummary, row.screeningSummary].filter(Boolean).join("；"),
     avgPlay,
     stablePlay,
     currentCpm,
@@ -81,6 +110,7 @@ export async function POST(request: NextRequest) {
 
   const body = (await request.json().catch(() => null)) as Body | null;
   const creatorId = body?.creatorId?.trim();
+  const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
 
   if (!creatorId) {
     return NextResponse.json({ error: "缺少 creatorId。" }, { status: 400 });
@@ -100,7 +130,14 @@ export async function POST(request: NextRequest) {
           works: {
             orderBy: [{ likeCount: "desc" }],
             take: 8
-          }
+          },
+          campaignTasks: campaignTaskId
+            ? {
+                where: { campaignTaskId },
+                include: { campaignTask: true },
+                take: 1
+              }
+            : false
         }
       });
 
@@ -108,17 +145,25 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "没有找到达人。" }, { status: 404 });
       }
 
+      const linkedTask = campaignTaskId ? creatorRow.campaignTasks?.[0] : null;
+      const campaignTask = linkedTask?.campaignTask
+        ? buildCampaignTask(linkedTask.campaignTask)
+        : campaignTaskId
+          ? buildCampaignTask(await prisma.campaignTask.findUnique({ where: { id: campaignTaskId } }))
+          : null;
+
       const result = await generateAiOutreachScript({
-        creator: buildCreator(creatorRow),
+        creator: buildCreator(creatorRow, linkedTask),
         taskKind: body?.taskKind || "initial",
         provider: body?.provider === "openai" ? "openai" : "default",
+        campaignTask,
         works: creatorRow.works || []
       });
 
       await prisma.outreachLog.create({
         data: {
           creatorId: creatorRow.id,
-          action: "generate_ai_script",
+          action: campaignTaskId ? "generate_campaign_ai_script" : "generate_ai_script",
           content: `复用画像：${result.portrait}\n\n生成建联话术：${result.script}`,
           oldStatus: creatorRow.outreachStatus,
           newStatus: creatorRow.outreachStatus

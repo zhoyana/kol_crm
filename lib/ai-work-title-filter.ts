@@ -97,6 +97,46 @@ function buildPrompt(keyword: string, works: WorkForAi[]): string {
   ].join("\n");
 }
 
+
+function formatTerms(terms?: string[]): string {
+  return terms?.length ? terms.join("、") : "未单独配置，请结合当前搜索关键词判断";
+}
+
+function buildPromptWithFilters(keyword: string, works: WorkForAi[], filters: DiscoveryFilterOptions): string {
+  return [
+    "你是抖音达人采集中的视频标题语义过滤器。",
+    "你的任务不是机械做关键词匹配，而是判断每条视频是否值得进入达人候选池。",
+    "",
+    `当前搜索关键词：${keyword}`,
+    `目标人群/强相关方向：${formatTerms(filters.primaryTerms)}`,
+    `辅助信号：${formatTerms(filters.supportTerms)}`,
+    `排除方向：${formatTerms(filters.excludeTerms)}`,
+    "",
+    "初筛目标是提高召回率，不要求一次判断账号是否最终合适；只要这条视频可能指向目标人群，就应该进入候选，交给后续主页复筛。",
+    "",
+    "保留 keep：",
+    "1. 标题、话题、来源关键词、创作者名任一位置出现目标人群或强相关方向。",
+    "2. 内容明显体现真实个人身份、行业/学习/工作日常、宿舍/通勤/值班/实习/记录/vlog 等可复筛信号。",
+    "3. 文案比较抽象或生活化，但来源关键词或话题已经指向目标人群，也可以 keep 或 maybe。",
+    "",
+    "待观察 maybe：",
+    "1. 可能是目标人群个人内容，但标题证据不足。",
+    "2. 标题抽象、玩梗、生活化，没有直接说明身份，但也没有明显跑偏。",
+    "3. 只看标题不能确认账号是否垂直，需要后续打开主页复筛。",
+    "",
+    "排除 drop：",
+    "1. 明显命中排除方向，尤其是官方号、机构号、培训招生、考试咨询、课程售卖、营销带货、纯科普引流。",
+    "2. 明显不是目标人群，且没有任何目标身份线索。",
+    "3. 不要因为点赞高就 keep，语义明显不符合仍然 drop。",
+    "",
+    "注意：这是初筛，不是终筛。宁愿多保留一些 maybe，也不要因为标题信息少就过早 drop。",
+    "",
+    "输出必须是 JSON，不要 Markdown。",
+    '{"decisions":[{"awemeId":"","decision":"keep|maybe|drop","reason":""}],"note":""}',
+    "reason 用一句中文说明判断依据。",
+    `作品标题列表：${JSON.stringify(works, null, 2)}`
+  ].join("\n");
+}
 async function requestAiWorkDecisions(keyword: string, works: WorkForAi[], filters: DiscoveryFilterOptions): Promise<WorkDecision[]> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey || !works.length) return [];
@@ -115,7 +155,7 @@ async function requestAiWorkDecisions(keyword: string, works: WorkForAi[], filte
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "你只输出可解析 JSON。" },
-        { role: "user", content: buildPrompt(keyword, works) }
+        { role: "user", content: buildPromptWithFilters(keyword, works, filters) }
       ]
     })
   });
@@ -151,3 +191,4 @@ export async function filterCandidatesByAiWorkTitles(
     .map((candidate) => rebuildDiscoveryCandidate(candidate, candidate.works.filter((work) => !aiDropIds.has(work.awemeId))))
     .filter((candidate): candidate is DouyinDiscoveryCandidate => Boolean(candidate));
 }
+

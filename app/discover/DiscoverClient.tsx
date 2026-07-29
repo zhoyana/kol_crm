@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import type { CampaignTaskItem } from "@/lib/campaign-tasks";
 import type { DiscoveryFilterOptions, DiscoverySortBy, DouyinDiscoveryCandidate } from "@/lib/douyin-import";
 import type { DiscoveryMode, TopicCandidate } from "@/lib/crawler-tasks";
 
@@ -23,6 +24,8 @@ type ImportResult = {
   skipped: number;
   total: number;
   errors: string[];
+  campaignTaskId?: number | null;
+  campaignTaskLinked?: number;
 };
 
 type CandidateViewFilter = "all" | "strong" | "watch";
@@ -71,6 +74,10 @@ type CrawlerTask = {
   selectedTopics: string[];
   topicLimit: number;
   activeKeywords: string[];
+};
+
+type DiscoverClientProps = {
+  initialCampaignTasks: CampaignTaskItem[];
 };
 
 function formatNumber(value: number): string {
@@ -204,7 +211,7 @@ function preferredTopics(topics: TopicCandidate[], limit: number): string[] {
   return (scored.length ? scored : topics.map((item) => item.topic)).slice(0, limit);
 }
 
-export function DiscoverClient() {
+export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
   const [keyword, setKeyword] = useState("警校生");
   const [maxNotes, setMaxNotes] = useState(20);
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>("single");
@@ -218,6 +225,8 @@ export function DiscoverClient() {
   const [excludeTerms, setExcludeTerms] = useState("");
   const [ruleProfiles, setRuleProfiles] = useState<RuleProfile[]>([]);
   const [selectedRuleProfileId, setSelectedRuleProfileId] = useState("");
+  const [campaignTasks] = useState(initialCampaignTasks);
+  const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState("");
   const [task, setTask] = useState<CrawlerTask | null>(null);
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [result, setResult] = useState<DiscoverResult | null>(null);
@@ -261,6 +270,11 @@ export function DiscoverClient() {
       .sort((a, b) => candidateRank(b) - candidateRank(a) || b.viralWorkCount - a.viralWorkCount || b.maxLikes - a.maxLikes || b.avgLikes - a.avgLikes);
   }, [candidateFilter, result?.candidates]);
 
+  const selectedCampaignTask = useMemo(
+    () => campaignTasks.find((item) => String(item.id) === selectedCampaignTaskId) || null,
+    [campaignTasks, selectedCampaignTaskId]
+  );
+
   useEffect(() => {
     if (task?.status !== "running") return;
 
@@ -300,6 +314,7 @@ export function DiscoverClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keyword: formatKeywordInput(keyword),
+          campaignTaskId: selectedCampaignTaskId || null,
           maxNotes,
           discoveryMode: "single",
           topicLimit,
@@ -381,6 +396,7 @@ export function DiscoverClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keyword,
+          campaignTaskId: selectedCampaignTaskId || null,
           topics: task.topicCandidates,
           primaryTerms: parseRuleTerms(primaryTerms),
           supportTerms: parseRuleTerms(supportTerms),
@@ -410,6 +426,9 @@ export function DiscoverClient() {
     return {
       publishWindowDays,
       sortBy,
+      primaryTerms: parseRuleTerms(primaryTerms),
+      supportTerms: parseRuleTerms(supportTerms),
+      excludeTerms: parseRuleTerms(excludeTerms),
       useAiWorkFilter
     };
   }
@@ -427,6 +446,18 @@ export function DiscoverClient() {
     setClearResult(`已应用规则模板：${profile.name}`);
   }
 
+  function applyCampaignTask(taskId: string) {
+    setSelectedCampaignTaskId(taskId);
+    const campaignTask = campaignTasks.find((item) => String(item.id) === taskId);
+    if (!campaignTask) return;
+
+    if (campaignTask.seedKeywords.length) setKeyword(campaignTask.seedKeywords.join(","));
+    setPrimaryTerms([campaignTask.targetAudience, campaignTask.targetDescription].filter(Boolean).join(","));
+    setSupportTerms(campaignTask.productSellingPoints.join(","));
+    setExcludeTerms(campaignTask.excludeKeywords.join(","));
+    setClearResult(`已应用品类任务：${campaignTask.name}`);
+  }
+
   async function fillRecommendedRules() {
     setLoading("ai-rules");
     setError("");
@@ -437,6 +468,7 @@ export function DiscoverClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keyword,
+          campaignTaskId: selectedCampaignTaskId || null,
           primaryTerms: parseRuleTerms(primaryTerms),
           supportTerms: parseRuleTerms(supportTerms),
           excludeTerms: parseRuleTerms(excludeTerms)
@@ -481,6 +513,7 @@ export function DiscoverClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keyword,
+          campaignTaskId: selectedCampaignTaskId || null,
           candidates: result.candidates
         })
       });
@@ -565,7 +598,7 @@ export function DiscoverClient() {
       const response = await fetch("/api/discover/douyin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keyword: formatKeywordInput(keyword), filters: buildDiscoveryFilters() })
+        body: JSON.stringify({ keyword: formatKeywordInput(keyword), campaignTaskId: selectedCampaignTaskId || null, filters: buildDiscoveryFilters() })
       });
       const data = await response.json();
 
@@ -592,7 +625,7 @@ export function DiscoverClient() {
       const response = await fetch("/api/discover/douyin/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ candidates: selectedCandidates })
+        body: JSON.stringify({ candidates: selectedCandidates, campaignTaskId: selectedCampaignTaskId || null })
       });
       const data = await parseResponse(response);
 
@@ -625,6 +658,43 @@ export function DiscoverClient() {
 
   return (
     <div className="discover-stack">
+      <section className="panel campaign-task-picker">
+        <div>
+          <h2>品类任务</h2>
+          <p>先选择一个品类任务，系统会自动带入采集关键词、筛选目标、排除方向和产品卖点。</p>
+        </div>
+        <div className="campaign-task-picker-controls">
+          <select onChange={(event) => applyCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+            <option value="">选择已保存任务</option>
+            {campaignTasks.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+          <Link className="secondary-link" href="/agent">
+            管理品类任务
+          </Link>
+        </div>
+        {selectedCampaignTask ? (
+          <div className="campaign-task-summary">
+            <div>
+              <span>推广产品</span>
+              <strong>{selectedCampaignTask.productName}</strong>
+            </div>
+            <div>
+              <span>目标人群</span>
+              <strong>{selectedCampaignTask.targetAudience}</strong>
+            </div>
+            <div>
+              <span>采集关键词</span>
+              <strong>{selectedCampaignTask.seedKeywords.join("，") || "-"}</strong>
+            </div>
+            <p>{selectedCampaignTask.targetDescription}</p>
+          </div>
+        ) : null}
+      </section>
+
       <section className="panel discover-search-panel">
         <div>
           <h2>抖音关键词发现</h2>
@@ -863,3 +933,4 @@ export function DiscoverClient() {
     </div>
   );
 }
+

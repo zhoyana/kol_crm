@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import type { CampaignTaskItem } from "@/lib/campaign-tasks";
 import type { ReviewCreator } from "@/lib/review";
 import type { HomepageReviewRules } from "@/lib/douyin-homepage";
 
@@ -71,14 +72,22 @@ function isPriorityCreator(creator: ReviewCreator): boolean {
 
 function buildBatchQueue(creators: ReviewCreator[], onlyPriorityBatch: boolean): ReviewCreator[] {
   const sorted = [...creators].sort((a, b) => creatorPriority(b) - creatorPriority(a));
-  if (!onlyPriorityBatch) return sorted.slice(0, 10);
+  if (!onlyPriorityBatch) return sorted.slice(0, 30);
 
   const priorityCreators = sorted.filter(isPriorityCreator);
-  return (priorityCreators.length ? priorityCreators : sorted).slice(0, 10);
+  return (priorityCreators.length ? priorityCreators : sorted).slice(0, 30);
 }
 
-export function ReviewClient({ initialCreators }: { initialCreators: ReviewCreator[] }) {
+type ReviewClientProps = {
+  initialCreators: ReviewCreator[];
+  initialCampaignTasks: CampaignTaskItem[];
+  initialCampaignTaskId: number | null;
+};
+
+export function ReviewClient({ initialCreators, initialCampaignTasks, initialCampaignTaskId }: ReviewClientProps) {
   const [creators, setCreators] = useState([...initialCreators].sort((a, b) => creatorPriority(b) - creatorPriority(a)));
+  const [campaignTasks] = useState(initialCampaignTasks);
+  const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
   const [runningId, setRunningId] = useState<number | null>(null);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [results, setResults] = useState<Record<number, ReviewResult>>({});
@@ -100,6 +109,17 @@ export function ReviewClient({ initialCreators }: { initialCreators: ReviewCreat
     return labels.length ? labels.join(" + ") : "不设置精选条件，活跃账号都进入精选库";
   }, [rules]);
 
+  const selectedCampaignTask = useMemo(
+    () => campaignTasks.find((task) => String(task.id) === selectedCampaignTaskId) || null,
+    [campaignTasks, selectedCampaignTaskId]
+  );
+
+  function changeCampaignTask(taskId: string) {
+    setSelectedCampaignTaskId(taskId);
+    const suffix = taskId ? `?campaignTaskId=${encodeURIComponent(taskId)}` : "";
+    window.location.href = `/review${suffix}`;
+  }
+
   function toggleRule(key: keyof HomepageReviewRules) {
     setRules((current) => ({ ...current, [key]: !current[key] }));
   }
@@ -117,6 +137,7 @@ export function ReviewClient({ initialCreators }: { initialCreators: ReviewCreat
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          campaignTaskId: selectedCampaignTaskId || null,
           rules,
           workLimit,
           allowFullRetry: options.allowFullRetry ?? true,
@@ -169,6 +190,7 @@ export function ReviewClient({ initialCreators }: { initialCreators: ReviewCreat
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ids: batch.map((creator) => creator.externalId || String(creator.id)),
+          campaignTaskId: selectedCampaignTaskId || null,
           rules,
           workLimit: batchWorkLimit,
           skipObviousMismatch: true
@@ -213,6 +235,43 @@ export function ReviewClient({ initialCreators }: { initialCreators: ReviewCreat
       <section className="panel review-note">
         <h2>待复筛池</h2>
         <p>这里的达人已经通过内容初筛。批量复筛默认只跑强候选，并用更少主页作品先快速判断；单个达人仍可手动复筛。</p>
+      </section>
+
+      <section className="panel campaign-task-picker">
+        <div>
+          <h2>品类任务</h2>
+          <p>复筛会按当前任务判断，并把结果写回这个任务下的达人状态。</p>
+        </div>
+        <div className="campaign-task-picker-controls">
+          <select onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+            <option value="">全局待复筛池</option>
+            {campaignTasks.map((task) => (
+              <option key={task.id} value={task.id}>
+                {task.name}
+              </option>
+            ))}
+          </select>
+          <a className="secondary-link" href="/agent">
+            管理品类任务
+          </a>
+        </div>
+        {selectedCampaignTask ? (
+          <div className="campaign-task-summary">
+            <div>
+              <span>推广产品</span>
+              <strong>{selectedCampaignTask.productName}</strong>
+            </div>
+            <div>
+              <span>目标人群</span>
+              <strong>{selectedCampaignTask.targetAudience}</strong>
+            </div>
+            <div>
+              <span>排除方向</span>
+              <strong>{selectedCampaignTask.excludeKeywords.join("，") || "-"}</strong>
+            </div>
+            <p>{selectedCampaignTask.targetDescription}</p>
+          </div>
+        ) : null}
       </section>
 
       <section className="panel">

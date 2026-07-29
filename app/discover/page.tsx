@@ -1,7 +1,12 @@
 import Link from "next/link";
+import { getCampaignTasks } from "@/lib/campaign-tasks";
 import { DiscoverClient } from "./DiscoverClient";
 
-export default function DiscoverPage() {
+export const dynamic = "force-dynamic";
+
+export default async function DiscoverPage() {
+  const campaignTasks = await getCampaignTasks();
+
   return (
     <main className="shell">
       <aside className="sidebar">
@@ -36,7 +41,7 @@ export default function DiscoverPage() {
           </Link>
         </header>
 
-        <DiscoverClient />
+        <DiscoverClient initialCampaignTasks={campaignTasks} />
       </section>
     </main>
   );

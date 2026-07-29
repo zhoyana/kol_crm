@@ -9,6 +9,7 @@ type TaskActionsProps = {
   profileUrl: string;
   script: string;
   taskKind: "initial" | "followup" | "negotiate";
+  campaignTaskId?: number | null;
 };
 
 type AiScriptResult = {
@@ -21,10 +22,11 @@ type AiScriptResult = {
   error?: string;
 };
 
-export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKind }: TaskActionsProps) {
+export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKind, campaignTaskId }: TaskActionsProps) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
-  const [generatingProvider, setGeneratingProvider] = useState<"" | "default" | "openai">("");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [message, setMessage] = useState("");
   const [draftScript, setDraftScript] = useState(script);
   const [aiMeta, setAiMeta] = useState<{ angle: string; reason: string; portrait: string; source: string } | null>(null);
@@ -38,8 +40,8 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
     }
   }
 
-  async function generateScript(provider: "default" | "openai" = "default") {
-    setGeneratingProvider(provider);
+  async function generateScript() {
+    setIsGenerating(true);
     setMessage("");
 
     try {
@@ -51,7 +53,8 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
         body: JSON.stringify({
           creatorId,
           taskKind,
-          provider
+          campaignTaskId: campaignTaskId || null,
+          provider: "default"
         })
       });
       const result = (await response.json().catch(() => ({}))) as AiScriptResult;
@@ -66,13 +69,13 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
         angle: result.angle || "建联话术",
         reason: result.reason || "",
         portrait: result.portrait || "",
-        source: result.source === "ai" ? (result.provider === "openai" ? "OpenAI 对比" : "默认模型") : "本地兜底"
+        source: result.source === "ai" ? "AI 接口" : "本地兜底"
       });
       setMessage(result.source === "ai" ? "AI 话术已生成，可以先看一下再发送。" : "已生成兜底话术，可以先手动调整。");
     } catch {
       setMessage("生成话术接口没有响应，请确认本地服务还在运行。");
     } finally {
-      setGeneratingProvider("");
+      setIsGenerating(false);
     }
   }
 
@@ -134,13 +137,55 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
       "mark_sent",
       copied ? `已向 ${creatorName} 发送建联消息，发送话术已复制到剪贴板。\n\n话术：${draftScript}` : `已向 ${creatorName} 发送建联消息。`
     );
-    if (updated) setMessage("已标记发送");
+    if (updated) setMessage("已标记发送。");
+  }
+
+  async function sendAutomatically() {
+    setMessage("");
+    if (!profileUrl) {
+      setMessage("这个达人没有抖音主页链接，无法自动建联。");
+      return;
+    }
+    if (!draftScript.trim()) {
+      setMessage("请先生成或填写建联话术。");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `确认立即向「${creatorName}」发送下面这条私信吗？\n\n${draftScript}\n\n发送后无法自动撤回。`
+    );
+    if (!confirmed) return;
+
+    setIsSending(true);
+    try {
+      const response = await fetch("/api/outreach/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profileUrl, message: draftScript })
+      });
+      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; message?: string; error?: string };
+      if (!response.ok || !result.ok) {
+        setMessage(result.error || "自动建联失败；没有标记为已发送。");
+        return;
+      }
+
+      const updated = await updateStatus(
+        "已建联",
+        "auto_send_douyin_message",
+        `已通过本地浏览器自动向 ${creatorName} 发送建联私信。\n\n话术：${draftScript}`
+      );
+      if (updated) setMessage("私信已发送，并已标记为已建联。");
+    } catch {
+      setMessage("自动建联接口没有响应；请确认9222浏览器已启动并已登录抖音。");
+    } finally {
+      setIsSending(false);
+    }
   }
 
   async function markFollowup() {
     setMessage("");
     const updated = await updateStatus("需跟进", "mark_followup", `将 ${creatorName} 标记为后续跟进。`);
-    if (updated) setMessage("已加入跟进");
+    if (updated) setMessage("已加入跟进。");
   }
 
   return (
@@ -159,11 +204,14 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
         ) : null}
       </details>
       <div className="task-actions">
-        <button className="secondary-button" disabled={isPending || Boolean(generatingProvider)} onClick={() => generateScript("default")} type="button">
-          {generatingProvider === "default" ? "生成中..." : "AI生成话术"}
+        <button className="secondary-button" disabled={isPending || isGenerating} onClick={generateScript} type="button">
+          {isGenerating ? "生成中..." : "AI生成话术"}
         </button>
         <button className="go-contact-button" disabled={isPending} onClick={startOutreach} type="button">
-          {isPending ? "处理中..." : "去建联"}
+          {isPending ? "处理中..." : "复制话术并去建联"}
+        </button>
+        <button className="go-contact-button" disabled={isPending || isSending} onClick={sendAutomatically} type="button">
+          {isSending ? "自动发送中..." : "确认并自动私信"}
         </button>
         <button className="secondary-button" disabled={isPending} onClick={markSent} type="button">
           标记已发送

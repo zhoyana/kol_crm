@@ -7,3 +7,4 @@ dist
 .env.local
 *.log
 tsconfig.tsbuildinfo
+.npm-cache

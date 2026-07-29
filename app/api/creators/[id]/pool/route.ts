@@ -8,9 +8,14 @@ type RouteContext = {
 
 const allowedPoolStatuses = new Set(["pending_review", "candidate", "featured", "skipped", "rejected"]);
 
+function normalizeCampaignTaskId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 export async function PATCH(request: NextRequest, context: RouteContext) {
   if (!process.env.DATABASE_URL) {
-    return NextResponse.json({ error: "还没有配置 MySQL，当前不能调整达人库类型。" }, { status: 503 });
+    return NextResponse.json({ error: "MySQL is not configured." }, { status: 503 });
   }
 
   const { id } = await context.params;
@@ -18,10 +23,12 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     poolStatus?: string;
     screeningStatus?: string;
     reason?: string;
+    campaignTaskId?: number | string | null;
   } | null;
+  const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
 
   if (!body?.poolStatus || !allowedPoolStatuses.has(body.poolStatus)) {
-    return NextResponse.json({ error: "无效的达人库类型。" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid creator pool status." }, { status: 400 });
   }
 
   try {
@@ -37,10 +44,56 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       });
 
       if (!creator) {
-        return NextResponse.json({ error: "没有找到这个达人。" }, { status: 404 });
+        return NextResponse.json({ error: "Creator not found." }, { status: 404 });
       }
 
-      const reason = body.reason?.trim() || "人工调整达人库类型";
+      const reason = body.reason?.trim() || "Manual pool status change.";
+
+      if (campaignTaskId) {
+        const linked = await prisma.creatorCampaignTask.upsert({
+          where: {
+            creatorId_campaignTaskId: {
+              creatorId: creator.id,
+              campaignTaskId
+            }
+          },
+          update: {
+            poolStatus: body.poolStatus,
+            screeningStatus: body.screeningStatus || "manual_pool_change",
+            screeningSummary: [creator.screeningSummary, reason].filter(Boolean).join("；")
+          },
+          create: {
+            creatorId: creator.id,
+            campaignTaskId,
+            poolStatus: body.poolStatus,
+            screeningStatus: body.screeningStatus || "manual_pool_change",
+            screeningSummary: reason
+          }
+        });
+
+        await prisma.outreachLog.create({
+          data: {
+            creatorId: creator.id,
+            action: "manual_move_campaign_pool",
+            content: reason,
+            oldStatus: creator.poolStatus,
+            newStatus: linked.poolStatus
+          }
+        });
+
+        return NextResponse.json({
+          ok: true,
+          campaignTaskId,
+          creator: {
+            id: creator.externalId || String(creator.id),
+            name: creator.name,
+            poolStatus: linked.poolStatus,
+            screeningStatus: linked.screeningStatus,
+            screeningSummary: linked.screeningSummary
+          }
+        });
+      }
+
       const updated = await prisma.creator.update({
         where: { id: creator.id },
         data: {
@@ -75,6 +128,6 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     }
   } catch (error) {
     console.error(error);
-    return NextResponse.json({ error: "达人库类型调整失败，请确认 MySQL 和 Prisma 正常。" }, { status: 500 });
+    return NextResponse.json({ error: "Failed to update creator pool status." }, { status: 500 });
   }
 }

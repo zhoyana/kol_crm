@@ -1,8 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { DouyinDiscoveryCandidate } from "@/lib/douyin-import";
+import { resolveDiscoveryRuleTemplate, type DiscoveryRuleTemplate } from "@/lib/discovery-rule-templates";
+
+type CampaignTask = {
+  name: string;
+  productName: string;
+  category: string | null;
+  targetAudience: string;
+  targetDescription: string;
+  seedKeywords: string[];
+  excludeKeywords: string[];
+  productSellingPoints: string[];
+};
 
 type CandidateScreenRequest = {
   keyword?: string;
+  campaignTaskId?: number | string | null;
   candidates?: DouyinDiscoveryCandidate[];
 };
 
@@ -12,22 +25,56 @@ type CandidateDecision = {
   reason: string;
 };
 
-function safeJsonParse(text: string): { decisions?: CandidateDecision[]; note?: string } {
+function normalizeTaskId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+async function loadCampaignTask(id: number | null): Promise<CampaignTask | null> {
+  if (!id || !process.env.DATABASE_URL) return null;
+  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
+  const PrismaClient = prismaModule.PrismaClient as new () => any;
+  const prisma = new PrismaClient();
+  try {
+    return await prisma.campaignTask.findUnique({ where: { id } });
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+function safeJsonParse(text: string): { decisions?: CandidateDecision[] } {
   const jsonText = text.match(/\{[\s\S]*\}/)?.[0] || text;
   try {
-    return JSON.parse(jsonText) as { decisions?: CandidateDecision[]; note?: string };
+    return JSON.parse(jsonText);
   } catch {
     return {};
   }
 }
 
-function normalizeDecision(value: unknown): "keep" | "maybe" | "drop" {
-  if (value === "keep" || value === "maybe" || value === "drop") return value;
-  return "maybe";
+function normalizeDecision(value: unknown): CandidateDecision["decision"] {
+  return value === "keep" || value === "drop" ? value : "maybe";
 }
 
 function normalizeText(value: string): string {
   return value.replace(/\s+/g, "").toLowerCase();
+}
+
+function includesAny(text: string, terms: string[]): boolean {
+  return terms.some((term) => text.includes(normalizeText(term)));
+}
+
+function taskText(task: CampaignTask | null): string {
+  if (!task) return "";
+  return [
+    task.name,
+    task.productName,
+    task.category || "",
+    task.targetAudience,
+    task.targetDescription,
+    ...(task.seedKeywords || []),
+    ...(task.excludeKeywords || []),
+    ...(task.productSellingPoints || [])
+  ].join(" ");
 }
 
 function compactCandidate(candidate: DouyinDiscoveryCandidate) {
@@ -35,197 +82,215 @@ function compactCandidate(candidate: DouyinDiscoveryCandidate) {
     id: candidate.externalId,
     name: candidate.name,
     accountType: candidate.accountType,
-    rejectReason: candidate.rejectReason,
-    currentBadge: candidate.screeningStatus,
-    profileUrl: candidate.profileUrl,
-    sampleAwemeUrl: candidate.sampleAwemeUrl,
     metrics: {
       workCount: candidate.workCount,
       avgLikes: candidate.avgLikes,
       maxLikes: candidate.maxLikes,
-      viralWorkCount: candidate.viralWorkCount,
-      recentWorkCount: candidate.recentWorkCount,
-      hasRecentQualifiedWork: candidate.hasRecentQualifiedWork,
-      hasRecentUpdate: candidate.hasRecentUpdate
+      viralWorkCount: candidate.viralWorkCount
     },
     sampleTitle: candidate.sampleTitle,
     screeningSummary: candidate.screeningSummary,
     works: candidate.works.slice(0, 10).map((work) => ({
       title: work.title,
       likeCount: work.likeCount,
-      publishedAt: work.publishedAt,
-      sourceKeyword: work.sourceKeyword,
-      url: work.url
+      sourceKeyword: work.sourceKeyword
     }))
   };
 }
 
-function textIncludesAny(text: string, terms: string[]): boolean {
-  return terms.some((term) => text.includes(normalizeText(term)));
-}
+function localHardDecision(candidate: DouyinDiscoveryCandidate, template: DiscoveryRuleTemplate): CandidateDecision | null {
+  const text = normalizeText([
+    candidate.name,
+    candidate.category || "",
+    candidate.accountType || "",
+    candidate.rejectReason || "",
+    candidate.sampleTitle || "",
+    candidate.screeningSummary || "",
+    ...candidate.works.slice(0, 10).map((work) => `${work.title} ${work.sourceKeyword || ""}`)
+  ].join(" "));
 
-function localHardDecision(candidate: DouyinDiscoveryCandidate): CandidateDecision | null {
-  const text = normalizeText(
-    [
-      candidate.name,
-      candidate.category || "",
-      candidate.accountType || "",
-      candidate.rejectReason || "",
-      candidate.sampleTitle || "",
-      candidate.screeningSummary || "",
-      ...candidate.works.slice(0, 10).map((work) => `${work.title} ${work.sourceKeyword || ""}`)
-    ].join(" ")
-  );
-  const hasPoliceSchoolStudyIdentity = textIncludesAny(text, [
-    "警校",
-    "警校生",
-    "警校生活",
-    "公安院校",
-    "公安大学",
-    "中国人民公安大学",
-    "警院",
-    "藏蓝青春",
-    "研究生",
-    "研一",
-    "学硕",
-    "专硕",
-    "学生证",
-    "训练",
-    "宿舍"
-  ]);
-
-  const dropRules: Array<[string, string[]]> = [
-    [
-      "疑似官方/认证/机构账号，建联难度高",
-      ["official", "government", "media", "school_account", "official_account", "蓝v", "蓝V", "黄v", "黄V", "认证", "官方", "官号", "媒体", "政务"]
-    ],
-    ["账号封禁或状态异常", ["封禁", "已封", "账号封禁", "用户封禁"]],
-    [
-      "内容偏讲解/解说/知识分享，不适合达人建联",
-      ["解说", "讲解", "讲座", "知识分享", "科普", "普法", "行业真相", "政策", "法规"]
-    ],
-    [
-      "内容偏已从业警察工作场景，不是目标警校生个人账号",
-      ["警察工作", "执法", "巡逻", "办案", "执勤", "出警", "抓捕", "警情", "民警", "特警", "交警", "辅警", "派出所", "公安局"]
-    ],
-    [
-      "内容偏培训/考试/备考咨询，不是建联达人",
-      ["培训", "高考志愿", "公安联考", "考试", "招警", "备考", "上岸", "分数线", "咨询"]
-    ],
-    ["内容偏颜值/抽象/泛娱乐，垂直度不足", ["颜值", "抽象", "整活", "搞笑", "娱乐", "擦边"]]
+  const hardAccountTypes = [
+    "official",
+    "brand",
+    "shop",
+    "media",
+    "government",
+    "school",
+    "verified",
+    "professional_verified",
+    "marketing_agency"
   ];
-
-  for (const [reason, terms] of dropRules) {
-    if (textIncludesAny(text, terms)) {
-      const isEducationExamRule = reason.includes("培训") || reason.includes("考试") || reason.includes("备考");
-      if (isEducationExamRule && hasPoliceSchoolStudyIdentity) continue;
-      return { id: candidate.externalId, decision: "drop", reason };
-    }
+  if (candidate.rejectReason || hardAccountTypes.includes(String(candidate.accountType || "").toLowerCase())) {
+    return {
+      id: candidate.externalId,
+      decision: "drop",
+      reason: candidate.rejectReason === "verified_account"
+        ? "黄V、职业认证或权威认证账号不进入待选"
+        : "官方、机构、运营服务或其他非个人账号不进入待选"
+    };
   }
 
-  if (!candidate.works.some((work) => work.likeCount > 500)) {
-    return { id: candidate.externalId, decision: "drop", reason: "样本作品点赞未超过500，不满足最低数据要求" };
+  if (candidate.fans >= 100_000) {
+    return { id: candidate.externalId, decision: "drop", reason: `粉丝 ${candidate.fans}，属于大V，不进入待选` };
   }
 
+  if (includesAny(text, ["账号封禁", "用户封禁", "已封禁"])) {
+    return { id: candidate.externalId, decision: "drop", reason: "账号已封禁或状态异常" };
+  }
+
+  if (includesAny(text, ["官方账号", "官方客服", "政务号", "媒体号", "培训机构", "招生办", "教育咨询", "品牌官方"])) {
+    return { id: candidate.externalId, decision: "drop", reason: "明显为官方、机构或培训账号" };
+  }
+
+  if (includesAny(text, template.candidateScreen.hardDropTerms)) {
+    return { id: candidate.externalId, decision: "drop", reason: `命中${template.name}硬排除规则` };
+  }
+
+  if (
+    !includesAny(text, template.candidateScreen.identityTerms) &&
+    includesAny(text, template.candidateScreen.obviousMismatchTerms)
+  ) {
+    return { id: candidate.externalId, decision: "drop", reason: `明显属于其他垂类，未发现${template.name}目标身份或场景` };
+  }
+
+  if (!candidate.works.some((work) => work.likeCount > template.candidateScreen.minSampleLikes)) {
+    return {
+      id: candidate.externalId,
+      decision: "drop",
+      reason: `当前样本没有点赞超过${template.candidateScreen.minSampleLikes}的作品`
+    };
+  }
   return null;
 }
 
-function buildPrompt(keyword: string, candidates: DouyinDiscoveryCandidate[]): string {
+function buildPrompt(keyword: string, task: CampaignTask | null, candidates: DouyinDiscoveryCandidate[]): string {
+  const template = resolveDiscoveryRuleTemplate(task);
+  const rules = template.candidateScreen.instructions;
+
   return [
-    "你是达人建联前的候选人过滤助手。",
-    "本轮唯一目标：找目前在校的警校生/公安院校在读学生/公安院校在读研究生个人创作者，适合警察小熊、警察通勤衣服、警校生活类合作。",
-    "只能根据候选人的结构化摘要判断，不要脑补主页没有展示的信息。",
-    "",
-    "keep 标准：",
-    "1. 明显像目前在校警校生/警院学生/公安院校学生/公安院校在读研究生的个人账号。",
-    "2. 内容围绕警校生日常、宿舍、上课、训练、校园、穿搭、vlog、毕业季等在校场景。",
-    "3. 至少一个样本作品点赞 > 500。",
-    "4. 主页/样本内容垂直，后续适合人工建联。",
-    "",
-    "maybe 标准：",
-    "1. 可能是在校警校生，但证据不够。",
-    "2. 只有少量警校生内容，主页垂直度还需要人工打开确认。",
-    "",
-    "drop 标准：",
-    "1. 只是刚好发过警校生内容，但账号主线是颜值、泛穿搭、抽象、娱乐、整活。",
-    "2. 解说、讲解、知识分享、科普、普法、行业真相类账号。",
-    "3. 官方号、媒体号、机构号、营销号、蓝V、黄V、认证号。",
-    "4. 已从业警察号，内容是执法、巡逻、办案、执勤、出警、案件、事故、新闻报道。",
-    "5. 主营报考、招生、培训、升学、公安联考、考试咨询类账号。",
-    "6. 但在校警校生/公安院校研究生偶尔发布提前批招生工作、考研上岸记录、学校招生活动、迎新介绍，不等于招生培训账号；如果同时有在校日常、宿舍、训练、校园生活、公安大学/警院在读线索，应 keep 或 maybe。",
-    "7. 账号封禁或状态异常。",
-    "8. 没有样本作品点赞超过500。",
-    "",
-    "输出必须是 JSON，不要 Markdown。",
-    'JSON 结构：{"decisions":[{"id":"","decision":"keep|maybe|drop","reason":""}],"note":""}',
-    "reason 用中文，简短说明保留/观察/排除原因。",
-    `当前关键词：${keyword}`,
-    `候选达人：${JSON.stringify(candidates.map(compactCandidate), null, 2)}`
+    "你是达人发现阶段的候选账号初筛助手。只能根据提供的搜索样本判断，不得脑补主页内容。",
+    `当前规则模板：${template.name} v${template.version}`,
+    `搜索关键词：${keyword}`,
+    `任务名称：${task?.name || "未指定"}`,
+    `推广产品：${task?.productName || "未指定"}`,
+    `目标人群：${task?.targetAudience || "结合搜索关键词判断"}`,
+    `筛选目标：${task?.targetDescription || "结合搜索关键词判断"}`,
+    `排除方向：${(task?.excludeKeywords || []).join("、") || "无"}`,
+    `模板强相关词：${template.discovery.primaryTerms.join("、") || "无"}`,
+    `模板辅助词：${template.discovery.supportTerms.join("、") || "无"}`,
+    `模板排除词：${template.discovery.excludeTerms.join("、") || "无"}`,
+    ...rules,
+    "每个候选必须返回一条结果。输出纯 JSON，不要 Markdown。",
+    '格式：{"decisions":[{"id":"","decision":"keep|maybe|drop","reason":""}],"note":""}',
+    `候选账号：${JSON.stringify(candidates.map(compactCandidate), null, 2)}`
   ].join("\n");
+}
+
+async function requestBatch(
+  apiKey: string,
+  baseUrl: string,
+  model: string,
+  keyword: string,
+  task: CampaignTask | null,
+  candidates: DouyinDiscoveryCandidate[]
+): Promise<CandidateDecision[]> {
+  let lastError = "AI候选过滤失败";
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "你只输出可解析 JSON。" },
+            { role: "user", content: buildPrompt(keyword, task, candidates) }
+          ]
+        }),
+        signal: AbortSignal.timeout(90_000)
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        lastError = data?.error?.message || `AI候选过滤失败（HTTP ${response.status}）`;
+        if (response.status < 500 && response.status !== 429) throw new Error(lastError);
+      } else {
+        const parsed = safeJsonParse(String(data?.choices?.[0]?.message?.content || ""));
+        return Array.isArray(parsed.decisions)
+          ? parsed.decisions.map((item) => ({
+              id: String(item.id || "").trim(),
+              decision: normalizeDecision(item.decision),
+              reason: String(item.reason || "").trim()
+            })).filter((item) => item.id)
+          : [];
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : lastError;
+    }
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1_500));
+    }
+  }
+  throw new Error(lastError);
 }
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as CandidateScreenRequest | null;
   const apiKey = process.env.OPENAI_API_KEY;
-  const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  if (!apiKey) {
-    return NextResponse.json({ error: "还没有配置 OPENAI_API_KEY。DeepSeek 或中转站也可以用这个变量保存 key。" }, { status: 400 });
-  }
+  if (!apiKey) return NextResponse.json({ error: "还没有配置 OPENAI_API_KEY。" }, { status: 400 });
 
   const keyword = body?.keyword?.trim() || "";
-  const candidates = (body?.candidates || []).slice(0, 60);
+  const candidates = (body?.candidates || []).slice(0, 600);
   if (!keyword || !candidates.length) {
     return NextResponse.json({ error: "缺少关键词或候选达人。" }, { status: 400 });
   }
 
-  const localDecisions = candidates.map(localHardDecision).filter((item): item is CandidateDecision => Boolean(item));
-  const localDropIds = new Set(localDecisions.map((item) => item.id));
-  const modelCandidates = candidates.filter((candidate) => !localDropIds.has(candidate.externalId));
-
-  if (!modelCandidates.length) {
-    return NextResponse.json({ decisions: localDecisions, note: "候选已被本地硬规则全部过滤。" });
-  }
-
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: "你只输出可解析 JSON。" },
-          { role: "user", content: buildPrompt(keyword, modelCandidates) }
-        ]
-      })
-    });
-
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      return NextResponse.json({ error: data?.error?.message || "AI 候选过滤失败。" }, { status: response.status });
+    const task = await loadCampaignTask(normalizeTaskId(body?.campaignTaskId));
+    const template = resolveDiscoveryRuleTemplate(task);
+    const localDecisions = candidates
+      .map((candidate) => localHardDecision(candidate, template))
+      .filter((item): item is CandidateDecision => Boolean(item));
+    const locallyHandled = new Set(localDecisions.map((item) => item.id));
+    const modelCandidates = candidates.filter((candidate) => !locallyHandled.has(candidate.externalId));
+    const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const batches: DouyinDiscoveryCandidate[][] = [];
+    for (let index = 0; index < modelCandidates.length; index += 30) {
+      batches.push(modelCandidates.slice(index, index + 30));
     }
 
-    const content = String(data?.choices?.[0]?.message?.content || "");
-    const parsed = safeJsonParse(content);
-    const decisions = Array.isArray(parsed.decisions)
-      ? parsed.decisions
-          .map((item) => ({
-            id: String(item.id || "").trim(),
-            decision: normalizeDecision(item.decision),
-            reason: String(item.reason || "").trim()
-          }))
-          .filter((item) => item.id)
-      : [];
+    const modelDecisions: CandidateDecision[] = [];
+    let failedBatchCount = 0;
+    for (let index = 0; index < batches.length; index += 2) {
+      const currentBatches = batches.slice(index, index + 2);
+      const results = await Promise.allSettled(
+        currentBatches.map((batch) => requestBatch(apiKey, baseUrl, model, keyword, task, batch))
+      );
+      results.forEach((result, resultIndex) => {
+        if (result.status === "fulfilled") {
+          modelDecisions.push(...result.value);
+          return;
+        }
+        failedBatchCount += 1;
+        modelDecisions.push(...currentBatches[resultIndex].map((candidate) => ({
+          id: candidate.externalId,
+          decision: "maybe" as const,
+          reason: "本批AI请求失败，已保留为待观察，稍后可重新筛选"
+        })));
+      });
+    }
 
-    return NextResponse.json({ decisions: [...localDecisions, ...decisions], note: String(parsed.note || "") });
+    return NextResponse.json({
+      decisions: [...localDecisions, ...modelDecisions],
+      template: { id: template.id, name: template.name, version: template.version },
+      note: failedBatchCount
+        ? `已按${template.name}初筛 ${candidates.length} 人；${failedBatchCount}批请求失败并保留为待观察`
+        : `已按${template.name}初筛 ${candidates.length} 人`
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "AI 候选过滤接口没有响应。";
+    const message = error instanceof Error ? error.message : "AI候选过滤接口没有响应";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

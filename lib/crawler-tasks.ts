@@ -25,6 +25,7 @@ export type CrawlerTaskSnapshot = {
   selectedTopics: string[];
   topicLimit: number;
   activeKeywords: string[];
+  collectedWorks: number;
 };
 
 type CrawlerContentItem = {
@@ -74,6 +75,7 @@ function makeIdleTask(): RunningCrawlerTask {
     selectedTopics: [],
     topicLimit: 3,
     activeKeywords: [],
+    collectedWorks: 0,
     process: null
   };
 }
@@ -411,8 +413,12 @@ function spawnCrawler(task: RunningCrawlerTask, keywords: string, stage: "keywor
 }
 
 export function getDouyinCrawlerTask(): CrawlerTaskSnapshot {
-  const { process: _process, ...snapshot } = currentTask();
-  return snapshot;
+  const task = currentTask();
+  const { process: _process, ...snapshot } = task;
+  return {
+    ...snapshot,
+    collectedWorks: task.startedAt ? readRecentItems(task).length : 0
+  };
 }
 
 export function startDouyinCrawlerTask(input: {

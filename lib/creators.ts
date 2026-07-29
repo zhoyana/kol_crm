@@ -6,6 +6,8 @@ export type CreatorPoolStatus = "pending_review" | "candidate" | "featured" | "s
 
 export type Creator = {
   id: string;
+  campaignTaskId?: number | null;
+  campaignTaskName?: string;
   name: string;
   platform: string;
   profileUrl: string;
@@ -49,6 +51,9 @@ type MiniPrismaClient = {
   creator: {
     findMany: (args?: any) => Promise<any[]>;
     findFirst: (args: any) => Promise<any | null>;
+  };
+  creatorCampaignTask: {
+    findMany: (args?: any) => Promise<any[]>;
   };
   $disconnect: () => Promise<void>;
 };
@@ -113,6 +118,8 @@ function buildCreator(input: {
   poolStatus?: CreatorPoolStatus;
   screeningStatus?: string;
   screeningSummary?: string;
+  campaignTaskId?: number | null;
+  campaignTaskName?: string;
 }): Creator {
   const stablePlay = median(input.plays);
   const avgPlay = input.plays.length ? Math.round(input.plays.reduce((sum, item) => sum + item, 0) / input.plays.length) : 0;
@@ -122,6 +129,8 @@ function buildCreator(input: {
 
   return {
     ...input,
+    campaignTaskId: input.campaignTaskId || null,
+    campaignTaskName: input.campaignTaskName || "",
     poolStatus: input.poolStatus || "candidate",
     screeningStatus: input.screeningStatus || "",
     screeningSummary: input.screeningSummary || "",
@@ -140,20 +149,56 @@ async function getPrisma(): Promise<MiniPrismaClient> {
   return new PrismaClient();
 }
 
-export async function getCreators(): Promise<Creator[]> {
-  const databaseCreators = await getCreatorsFromDatabase();
+export async function getCreators(campaignTaskId?: number | null): Promise<Creator[]> {
+  const databaseCreators = await getCreatorsFromDatabase(campaignTaskId);
   if (databaseCreators.length > 0) return databaseCreators;
 
   return getCreatorsFromCsv();
 }
 
-async function getCreatorsFromDatabase(): Promise<Creator[]> {
+async function getCreatorsFromDatabase(campaignTaskId?: number | null): Promise<Creator[]> {
   if (!process.env.DATABASE_URL) return [];
 
   try {
     const prisma = await getPrisma();
 
     try {
+      if (campaignTaskId) {
+        const rows = await prisma.creatorCampaignTask.findMany({
+          where: {
+            campaignTaskId,
+            poolStatus: { in: ["pending_review", "candidate", "featured", "skipped"] }
+          },
+          include: {
+            campaignTask: true,
+            creator: true
+          },
+          orderBy: [{ poolStatus: "asc" }, { updatedAt: "desc" }]
+        });
+
+        return rows.map((row: any) =>
+          buildCreator({
+            id: row.creator.externalId || String(row.creator.id),
+            campaignTaskId: row.campaignTaskId,
+            campaignTaskName: row.campaignTask?.name || "",
+            name: row.creator.name,
+            platform: row.creator.platform,
+            profileUrl: row.creator.profileUrl || "",
+            fans: row.creator.fans,
+            plays: normalizePlays(row.creator.plays),
+            quote: row.creator.quote,
+            outreachStatus: row.creator.outreachStatus || "未建联",
+            cooperationStatus: row.creator.cooperationStatus || "-",
+            category: row.campaignTask?.category || row.creator.category || "未分类",
+            contact: row.creator.contact || "-",
+            notes: row.notes || row.creator.notes || "",
+            poolStatus: row.poolStatus || row.creator.poolStatus || "candidate",
+            screeningStatus: row.screeningStatus || row.creator.screeningStatus || "",
+            screeningSummary: row.screeningSummary || row.creator.screeningSummary || ""
+          })
+        );
+      }
+
       const rows = await prisma.creator.findMany({
         where: {
           poolStatus: { in: ["pending_review", "candidate", "featured", "skipped"] }
@@ -164,6 +209,8 @@ async function getCreatorsFromDatabase(): Promise<Creator[]> {
       return rows.map((row: any) =>
         buildCreator({
           id: row.externalId || String(row.id),
+          campaignTaskId: null,
+          campaignTaskName: "",
           name: row.name,
           platform: row.platform,
           profileUrl: row.profileUrl || "",
