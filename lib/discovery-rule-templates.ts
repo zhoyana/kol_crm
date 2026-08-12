@@ -7,6 +7,10 @@ export type DiscoveryCampaignTask = {
   seedKeywords?: string[];
   excludeKeywords?: string[];
   productSellingPoints?: string[];
+  /** 绑定的人群模板 id（来自 CreatorAudienceTemplate），优先于文本匹配 */
+  audienceTemplateId?: number | null;
+  /** 创建任务时从模板拷贝的规则快照（完整 DiscoveryRuleTemplate） */
+  audienceTemplateSnapshot?: unknown;
 };
 
 export type DiscoveryRuleTemplate = {
@@ -37,6 +41,17 @@ export type DiscoveryRuleTemplate = {
     minDailyWorks: number;
     minLifestyleWorks: number;
     forceFullSample: boolean;
+  };
+  metricRules: {
+    matchMode: "all" | "any";
+    requireAvgLikes: boolean;
+    avgLikesThreshold: number;
+    requireViralWorks: boolean;
+    viralLikesThreshold: number;
+    minViralWorks: number;
+    requireSampleWorks: boolean;
+    minSampleWorks: number;
+    requireRecentUpdate: boolean;
   };
 };
 
@@ -81,12 +96,23 @@ export const POLICE_BEAR_TEMPLATE: DiscoveryRuleTemplate = {
     minDailyWorks: 2,
     minLifestyleWorks: 0,
     forceFullSample: false
+  },
+  metricRules: {
+    matchMode: "all",
+    requireAvgLikes: true,
+    avgLikesThreshold: 500,
+    requireViralWorks: true,
+    viralLikesThreshold: 2000,
+    minViralWorks: 1,
+    requireSampleWorks: false,
+    minSampleWorks: 10,
+    requireRecentUpdate: false
   }
 };
 
 export const MEDICAL_BEAR_TEMPLATE: DiscoveryRuleTemplate = {
   id: "medical-bear",
-  version: 1,
+  version: 4,
   name: "医护小熊达人发现模板",
   matchTerms: ["医护小熊", "医护", "医学生", "医生", "护士", "护理", "规培", "实习医生"],
   discovery: {
@@ -132,22 +158,34 @@ export const MEDICAL_BEAR_TEMPLATE: DiscoveryRuleTemplate = {
   },
   homepageReview: {
     instructions: [
-      "账号必须同时呈现稳定的本人医护身份/工作或学习场景，以及真实的非医护个人生活分享。",
+      "账号需要稳定呈现本人医护身份，并以真实工作/学习日常、同事互动、轻松表达或非医护个人生活为主。",
       "pass 需要多条医院、值班、夜班、规培、实习、轮转、科室、病房或白大褂等本人医护日常。",
       "黄V/职业认证/权威认证账号、大V、纯医学科普、疾病讲解、升学规划、护考报考培训、招聘考试、医生IP运营培训、剧情漫画故事和机构账号必须直接排除，不能进入待选。",
       "本人是护士或医生不能自动放行；护考/报考/求职考试占主页多数，或护士标签包装的泛娱乐段子占主页多数时，必须直接排除。",
-      "医护口播答疑或科普即使由真人发布，只要缺少明确的非医护生活内容，也最多判 maybe。",
-      "样本不足、身份内容不足或个人生活内容不足时只能进入待选。"
+      "医护口播答疑或科普即使由真人发布，只要主页主要是疾病知识、教学或答疑且缺少真实日常和个人表达，也最多判 maybe。",
+      "最近至少 8 条作品中必须有至少 2 条明确的非职业个人生活内容；主页几乎全是医院工作、夜班、科研、论文、学历或就业经历时必须直接排除。",
+      "样本不足、身份内容不足或真实医护日常不足时只能进入待选。"
     ],
     identityTerms: ["医学生", "医生", "护士", "护理", "规培", "实习医生", "医护", "医院", "科室", "值班", "夜班", "轮转", "白大褂"],
     dailyTerms: ["医学生日常", "护士日常", "医院日常", "值班", "夜班", "上班", "规培", "实习", "轮转", "科室", "门诊", "病房", "查房", "白大褂"],
-    lifestyleTerms: ["自拍", "宿舍", "通勤", "下班", "朋友", "旅行", "宠物", "吃饭", "逛街", "健身", "毕业", "日常生活", "生活碎片", "精神状态", "跳舞", "搞笑", "情绪", "娱乐"],
+    lifestyleTerms: ["自拍", "宿舍", "通勤", "下班", "和朋友", "朋友聚会", "朋友一起", "闺蜜", "同学聚会", "旅行", "宠物", "探店", "聚餐", "美食", "做饭", "吃播", "逛街", "健身", "毕业", "日常生活", "生活碎片", "精神状态", "跳舞", "搞笑", "情绪", "娱乐"],
     dominantRejectTerms: ["科普", "疾病讲解", "育儿", "志愿", "考研", "保研", "分数线", "就业薪资", "升学规划", "护考", "护士资格证", "报考", "招聘考试", "考公", "考编", "网课", "剧情", "演绎", "段子", "漫画", "故事"],
     minSamplesForFeatured: 8,
     minIdentityWorks: 3,
     minDailyWorks: 3,
     minLifestyleWorks: 2,
     forceFullSample: true
+  },
+  metricRules: {
+    matchMode: "any",
+    requireAvgLikes: true,
+    avgLikesThreshold: 500,
+    requireViralWorks: true,
+    viralLikesThreshold: 2000,
+    minViralWorks: 1,
+    requireSampleWorks: false,
+    minSampleWorks: 10,
+    requireRecentUpdate: false
   }
 };
 
@@ -179,6 +217,17 @@ export const GENERIC_DISCOVERY_TEMPLATE: DiscoveryRuleTemplate = {
     minDailyWorks: 0,
     minLifestyleWorks: 0,
     forceFullSample: false
+  },
+  metricRules: {
+    matchMode: "all",
+    requireAvgLikes: false,
+    avgLikesThreshold: 500,
+    requireViralWorks: false,
+    viralLikesThreshold: 2000,
+    minViralWorks: 1,
+    requireSampleWorks: false,
+    minSampleWorks: 10,
+    requireRecentUpdate: false
   }
 };
 
@@ -202,7 +251,24 @@ export function campaignTaskText(task?: DiscoveryCampaignTask | null): string {
   ].filter(Boolean).join(" ");
 }
 
+function isResolvedTemplate(value: unknown): value is DiscoveryRuleTemplate {
+  if (!value || typeof value !== "object") return false;
+  const t = value as Record<string, unknown>;
+  return (
+    typeof t.id === "string" &&
+    !!t.discovery && typeof t.discovery === "object" &&
+    !!t.candidateScreen && typeof t.candidateScreen === "object" &&
+    !!t.homepageReview && typeof t.homepageReview === "object" &&
+    !!t.metricRules && typeof t.metricRules === "object"
+  );
+}
+
 export function resolveDiscoveryRuleTemplate(task?: DiscoveryCampaignTask | null): DiscoveryRuleTemplate {
+  // 优先使用任务绑定的人群模板快照（品牌 → 固定达人模板 → 任务）
+  if (task && task.audienceTemplateSnapshot && isResolvedTemplate(task.audienceTemplateSnapshot)) {
+    return task.audienceTemplateSnapshot as DiscoveryRuleTemplate;
+  }
+  // 兼容历史任务：仍按任务文本模糊匹配硬编码模板
   const text = normalize(campaignTaskText(task));
   return DISCOVERY_RULE_TEMPLATES.find((template) => template.matchTerms.some((term) => text.includes(normalize(term))))
     || GENERIC_DISCOVERY_TEMPLATE;

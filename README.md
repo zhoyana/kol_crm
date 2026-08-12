@@ -147,13 +147,15 @@ npm run db:push
 POST /api/creators/:id/ai-evaluate
 ```
 
-如果 `.env` 里配置了 `OPENAI_API_KEY`，会调用 OpenAI Responses API；如果没有配置，会使用本地规则生成兜底结果，页面仍然可用。
+Agent 策略思考层读取 `.env` 中的 DeepSeek 配置，不使用 OpenAI Key。若未配置 DeepSeek，固定六阶段规则流程仍可运行，但不会生成模型策略建议。
 
 `.env` 示例：
 
 ```text
-OPENAI_API_KEY="你的 OpenAI API Key"
-OPENAI_MODEL="gpt-5.5-mini"
+DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+DEEPSEEK_MODEL="deepseek-v4-flash"
+AGENT_STRATEGY_MODEL="deepseek-v4-flash"
 ```
 
 AI 输出会包含：
@@ -193,3 +195,25 @@ npm run db:push
 5. 如果 `work/MediaCrawler-main/data/douyin/jsonl` 里已经有最新结果，可以直接点“一键导入最新采集结果”。
 
 后续接星图、蒲公英、小红书时，建议继续按这个模式做：每个平台一个适配器，最后统一转成 `Creator` 入库字段。
+
+## 后台 Agent Worker
+
+Agent 六阶段流程由独立 Node.js Worker 执行。开发环境需要同时启动两个进程：
+
+```powershell
+npm run dev
+```
+
+另开一个终端：
+
+```powershell
+npm run worker
+```
+
+Worker 默认调用 `http://127.0.0.1:3000` 上的现有采集、发现和复筛 API。部署到其他地址时配置：
+
+```text
+APP_BASE_URL="https://你的内部网站地址"
+```
+
+页面只负责创建后台任务、显示数据库进度，以及发送暂停、继续和取消请求。关闭或刷新页面不会终止 Worker。生产环境必须把 Web 与 Worker 配置成两个独立的常驻进程。

@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { ensureCdpBrowser, restartCdpBrowser } from "./cdp-browser";
+import { acquireCdpTaskLock } from "./cdp-task-lock";
 import { extractTopicCandidates as extractTopics, type TopicCandidate, type TopicRuleOptions } from "./topic-extractor";
 
 export type CrawlerTaskStatus = "idle" | "running" | "waiting_topics" | "succeeded" | "failed" | "stopped";
@@ -41,7 +43,9 @@ type RunningCrawlerTask = CrawlerTaskSnapshot & {
   publishWindowDays?: number;
   sortBy?: string;
   topicRules?: TopicRuleOptions;
+  restartCdpBeforeSpawn?: boolean;
   retriedWithoutSearchFilters?: boolean;
+  retriedAfterCdpRestart?: boolean;
 };
 
 const globalForCrawler = globalThis as typeof globalThis & {
@@ -308,107 +312,169 @@ function finishWithPartialSuccess(task: RunningCrawlerTask, stage: "keyword" | "
 
 function spawnCrawler(task: RunningCrawlerTask, keywords: string, stage: "keyword" | "topic") {
   const dir = crawlerDir();
+  const uvCommand = process.env.CRAWLER_UV_COMMAND || "uv";
+  const inheritedEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path")
+  );
+  const crawlerPath = process.env.CRAWLER_PATH || process.env.PATH || process.env.Path || "";
   const args = buildArgs(keywords, task.maxNotes, task);
   const taskId = task.id;
-  const child = spawn("uv", args, {
-    cwd: dir,
-    shell: false,
-    windowsHide: true,
-    env: {
-      ...process.env,
-      PYTHONIOENCODING: "utf-8"
-    }
-  });
-
-  task.process = child;
-  task.pid = child.pid ?? null;
   task.stage = stage;
   task.activeKeywords = splitKeywords(keywords);
-  task.command = `uv ${args.join(" ")}`;
+  task.command = `${uvCommand} ${args.join(" ")}`;
   task.status = "running";
   pushLog(task, stage === "keyword" ? `Keyword crawl: ${keywords}` : `Topic crawl: ${keywords}`);
+  pushLog(task, "正在排队等待抖音 CDP 采集资源…");
 
-  child.stdout.on("data", (chunk) => pushLog(task, chunk));
-  child.stderr.on("data", (chunk) => pushLog(task, chunk));
-
-  child.on("error", (error) => {
-    if (currentTask().id !== taskId) return;
-    task.status = "failed";
-    task.error = error.message;
-    task.finishedAt = new Date().toISOString();
-    task.process = null;
-    pushLog(task, `Crawler start failed: ${error.message}`);
-  });
-
-  child.on("close", (code) => {
-    if (currentTask().id !== taskId) return;
-
-    if (task.status === "stopped") {
-      task.exitCode = code;
-      task.process = null;
-      task.pid = null;
-      task.finishedAt = task.finishedAt || new Date().toISOString();
+  void acquireCdpTaskLock({
+    taskType: stage === "keyword" ? "keyword_crawl" : "topic_crawl",
+    taskId,
+    detail: keywords,
+    onWait: (owner) => {
+      const message = `等待抖音采集资源；当前占用：${owner?.taskType || "未知任务"} ${owner?.detail || ""}`.trim();
+      if (task.logs.at(-1) !== message) pushLog(task, message);
+    }
+  }).then(async (lease) => {
+    if (currentTask().id !== taskId || task.status === "stopped") {
+      await lease.release();
       return;
     }
 
-    task.exitCode = code;
-    task.process = null;
-    task.pid = null;
-
-    const collectedItems = readRecentItems(task);
-    const hasSearchFilters = Boolean(task.publishWindowDays && task.publishWindowDays > 0) || Boolean(task.sortBy && task.sortBy !== "relevance");
-    if (code === 0 && stage === "keyword" && !collectedItems.length && hasSearchFilters && !task.retriedWithoutSearchFilters) {
-      task.retriedWithoutSearchFilters = true;
-      task.publishWindowDays = 0;
-      task.sortBy = "relevance";
-      pushLog(task, "Keyword crawl returned 0 works with search filters. Retrying once without publish time and sort filters.");
-      spawnCrawler(task, keywords, stage);
-      return;
-    }
-
-    if (code !== 0) {
-      if (finishWithPartialSuccess(task, stage, code)) return;
-
-      task.status = "failed";
-      task.finishedAt = new Date().toISOString();
-      task.error = `Crawler failed, exit code: ${code}`;
-      pushLog(task, task.error);
-      return;
-    }
-
-    if (stage === "keyword" && task.discoveryMode !== "single") {
-      task.topicCandidates = extractTopicCandidates(task);
-
-      if (task.topicCandidates.length === 0) {
-        pushLog(task, "First round finished, but no usable topic was extracted. Using current works as result.");
-        task.status = "succeeded";
-        task.stage = "done";
-        task.finishedAt = new Date().toISOString();
-        return;
-      }
-
+    try {
+      const shouldRestartCdp = Boolean(task.restartCdpBeforeSpawn);
+      task.restartCdpBeforeSpawn = false;
+      const status = shouldRestartCdp ? await restartCdpBrowser() : await ensureCdpBrowser();
       pushLog(
         task,
-        `Topic candidates: ${task.topicCandidates.map((item) => `${item.topic}(${item.count}/${Math.round(item.score)}/${item.source})`).join(", ")}`
+        shouldRestartCdp
+          ? `CDP Chrome 已恢复并重新启动：127.0.0.1:${status.port}`
+          : status.started
+          ? `CDP Chrome 已自动启动：127.0.0.1:${status.port}`
+          : `CDP Chrome 已就绪：127.0.0.1:${status.port}`
       );
+      const child = spawn(uvCommand, args, {
+        cwd: dir,
+        shell: false,
+        windowsHide: true,
+        env: {
+          ...inheritedEnv,
+          PATH: crawlerPath,
+          PYTHONIOENCODING: "utf-8"
+        } as unknown as NodeJS.ProcessEnv
+      });
 
-      if (task.discoveryMode === "two_stage_manual") {
-        task.status = "waiting_topics";
-        pushLog(task, "Waiting for topic selection.");
-        return;
-      }
+      task.process = child;
+      task.pid = child.pid ?? null;
+      await lease.setPid(task.pid);
 
-      const autoTopics = preferredTopicCandidates(task).slice(0, task.topicLimit).map((item) => item.topic);
-      task.selectedTopics = autoTopics;
-      pushLog(task, `Auto selected topics: ${autoTopics.join(", ")}`);
-      spawnCrawler(task, autoTopics.join(","), "topic");
-      return;
+      child.stdout.on("data", (chunk) => pushLog(task, chunk));
+      child.stderr.on("data", (chunk) => pushLog(task, chunk));
+
+      child.on("error", (error) => {
+        void lease.release();
+        if (currentTask().id !== taskId) return;
+        task.status = "failed";
+        task.error = error.message;
+        task.finishedAt = new Date().toISOString();
+        task.process = null;
+        task.pid = null;
+        pushLog(task, `Crawler start failed: ${error.message}`);
+      });
+
+      child.on("close", (code) => {
+        void (async () => {
+          await lease.release();
+          if (currentTask().id !== taskId) return;
+
+          if (task.status === "stopped") {
+            task.exitCode = code;
+            task.process = null;
+            task.pid = null;
+            task.finishedAt = task.finishedAt || new Date().toISOString();
+            return;
+          }
+
+          task.exitCode = code;
+          task.process = null;
+          task.pid = null;
+
+          const collectedItems = readRecentItems(task);
+          const hasSearchFilters = Boolean(task.publishWindowDays && task.publishWindowDays > 0) || Boolean(task.sortBy && task.sortBy !== "relevance");
+          if (code === 0 && stage === "keyword" && !collectedItems.length && hasSearchFilters && !task.retriedWithoutSearchFilters) {
+            task.retriedWithoutSearchFilters = true;
+            task.publishWindowDays = 0;
+            task.sortBy = "relevance";
+            pushLog(task, "Keyword crawl returned 0 works with search filters. Retrying once without publish time and sort filters.");
+            spawnCrawler(task, keywords, stage);
+            return;
+          }
+
+          if (code !== 0) {
+            const cdpTakeoverFailed = task.logs.slice(-120).some((line) =>
+              /connect_over_cdp|无法接管已登录的CDP浏览器|Unable to take control of the logged-in CDP browser/i.test(line)
+            );
+            if (cdpTakeoverFailed && !task.retriedAfterCdpRestart) {
+              task.retriedAfterCdpRestart = true;
+              task.restartCdpBeforeSpawn = true;
+              pushLog(task, "CDP 接管失败，正在重启专用 Chrome 并重试当前采集。");
+              spawnCrawler(task, keywords, stage);
+              return;
+            }
+            if (finishWithPartialSuccess(task, stage, code)) return;
+            task.status = "failed";
+            task.finishedAt = new Date().toISOString();
+            task.error = `Crawler failed, exit code: ${code}`;
+            pushLog(task, task.error);
+            return;
+          }
+
+          if (stage === "keyword" && task.discoveryMode !== "single") {
+            task.topicCandidates = extractTopicCandidates(task);
+            if (task.topicCandidates.length === 0) {
+              pushLog(task, "First round finished, but no usable topic was extracted. Using current works as result.");
+              task.status = "succeeded";
+              task.stage = "done";
+              task.finishedAt = new Date().toISOString();
+              return;
+            }
+            pushLog(
+              task,
+              `Topic candidates: ${task.topicCandidates.map((item) => `${item.topic}(${item.count}/${Math.round(item.score)}/${item.source})`).join(", ")}`
+            );
+            if (task.discoveryMode === "two_stage_manual") {
+              task.status = "waiting_topics";
+              pushLog(task, "Waiting for topic selection.");
+              return;
+            }
+            const autoTopics = preferredTopicCandidates(task).slice(0, task.topicLimit).map((item) => item.topic);
+            task.selectedTopics = autoTopics;
+            pushLog(task, `Auto selected topics: ${autoTopics.join(", ")}`);
+            spawnCrawler(task, autoTopics.join(","), "topic");
+            return;
+          }
+
+          task.status = "succeeded";
+          task.stage = "done";
+          task.finishedAt = new Date().toISOString();
+          pushLog(task, "Crawler task completed.");
+        })();
+      });
+    } catch (error) {
+      await lease.release();
+      if (currentTask().id !== taskId) return;
+      task.status = "failed";
+      task.error = error instanceof Error ? error.message : "启动采集任务失败";
+      task.finishedAt = new Date().toISOString();
+      task.process = null;
+      task.pid = null;
+      pushLog(task, task.error);
     }
-
-    task.status = "succeeded";
-    task.stage = "done";
+  }).catch((error) => {
+    if (currentTask().id !== taskId) return;
+    task.status = "failed";
+    task.error = error instanceof Error ? error.message : "等待抖音采集资源失败";
     task.finishedAt = new Date().toISOString();
-    pushLog(task, "Crawler task completed.");
+    pushLog(task, task.error);
   });
 }
 
@@ -429,6 +495,7 @@ export function startDouyinCrawlerTask(input: {
   publishWindowDays?: number;
   sortBy?: string;
   topicRules?: TopicRuleOptions;
+  restartCdpBeforeSpawn?: boolean;
 }): CrawlerTaskSnapshot {
   const keyword = input.keyword.trim();
   const maxNotes = Math.min(Math.max(Number(input.maxNotes) || 20, 10), 300);
@@ -437,7 +504,7 @@ export function startDouyinCrawlerTask(input: {
   const task = currentTask();
 
   if (!keyword) throw new Error("请输入关键词。");
-  if (task.status === "running" && task.process) throw new Error("已有采集任务正在运行，请等它结束后再启动。");
+  if (task.status === "running") throw new Error("已有采集任务正在运行或等待采集资源，请等它结束后再启动。");
 
   const dir = crawlerDir();
   if (!existsSync(path.join(dir, "main.py"))) throw new Error(`没有找到 MediaCrawler 项目：${dir}`);
@@ -454,6 +521,7 @@ export function startDouyinCrawlerTask(input: {
     publishWindowDays: input.publishWindowDays,
     sortBy: input.sortBy,
     topicRules: input.topicRules,
+    restartCdpBeforeSpawn: Boolean(input.restartCdpBeforeSpawn),
     logs: [
       discoveryMode === "two_stage_manual"
         ? `启动二段式发现：关键词=${keyword}，第一轮完成后生成话题候选池`
@@ -485,6 +553,15 @@ export function continueDouyinCrawlerWithTopics(topics: string[]): CrawlerTaskSn
 
 export function stopDouyinCrawlerTask(): CrawlerTaskSnapshot {
   const task = currentTask();
+
+  if (task.status === "running" && !task.process) {
+    task.status = "stopped";
+    task.stage = "done";
+    task.finishedAt = new Date().toISOString();
+    task.error = "";
+    pushLog(task, "已取消等待抖音采集资源。");
+    return getDouyinCrawlerTask();
+  }
 
   if (task.status !== "running" || !task.process) {
     if (task.status === "waiting_topics") {

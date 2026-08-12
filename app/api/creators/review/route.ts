@@ -1,8 +1,83 @@
 import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
 
 function normalizeCampaignTaskId(value: unknown): number | null {
   const id = Number(value);
   return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+export async function GET(request: NextRequest) {
+  if (!process.env.DATABASE_URL) {
+    return NextResponse.json({ error: "MySQL is not configured." }, { status: 503 });
+  }
+
+  const campaignTaskId = normalizeCampaignTaskId(request.nextUrl.searchParams.get("campaignTaskId"));
+  const stage = request.nextUrl.searchParams.get("stage") === "reviewing" ? "reviewing" : "profiling";
+  if (!campaignTaskId) {
+    return NextResponse.json({ error: "缺少有效的品类任务 ID。" }, { status: 400 });
+  }
+
+  // prisma singleton from import
+  try {
+    const links = await prisma.creatorCampaignTask.findMany({
+      where: {
+        campaignTaskId,
+        ...(stage === "reviewing"
+          ? {
+              OR: [
+                {
+                  poolStatus: "candidate",
+                  screeningStatus: "portrait_passed"
+                },
+                {
+                  poolStatus: "featured",
+                  screeningStatus: {
+                    in: ["featured_stable", "featured_trending"]
+                  }
+                }
+              ]
+            }
+          : {
+              OR: [
+                { poolStatus: "pending_review" },
+                {
+                  poolStatus: "candidate",
+                  screeningStatus: { not: "portrait_passed" }
+                }
+              ]
+            })
+      },
+      include: {
+        creator: {
+          select: {
+            id: true,
+            externalId: true,
+            name: true
+          }
+        }
+      },
+      orderBy: { updatedAt: "asc" },
+      take: 600
+    });
+    const creators = links.map((link: any) => ({
+      id: link.creator.id,
+      externalId: link.creator.externalId || String(link.creator.id),
+      name: link.creator.name,
+      poolStatus: link.poolStatus,
+      screeningStatus: link.screeningStatus
+    }));
+
+    return NextResponse.json({
+      ok: true,
+      campaignTaskId,
+      stage,
+      total: creators.length,
+      ids: creators.map((creator: any) => creator.externalId || `db:${creator.id}`),
+      creators
+    });
+  } finally {
+    // prisma singleton — do not disconnect
+  }
 }
 
 export async function PATCH(request: NextRequest) {
@@ -23,8 +98,7 @@ export async function PATCH(request: NextRequest) {
   }
 
   try {
-    const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-    const prisma = new prismaModule.PrismaClient();
+    // prisma singleton from import
     const numericIds = ids.map((id) => Number(id)).filter((id) => Number.isInteger(id));
     const reason = body?.reason?.trim() || "Batch send to review.";
 
@@ -113,7 +187,7 @@ export async function PATCH(request: NextRequest) {
         ids: reviewableCreators.map((creator: any) => creator.externalId || String(creator.id))
       });
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch (error) {
     console.error(error);

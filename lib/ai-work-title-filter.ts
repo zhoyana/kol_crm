@@ -143,22 +143,30 @@ async function requestAiWorkDecisions(keyword: string, works: WorkForAi[], filte
 
   const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "你只输出可解析 JSON。" },
-        { role: "user", content: buildPromptWithFilters(keyword, works, filters) }
-      ]
-    })
-  });
+  const timeoutMs = Math.max(10_000, Number(process.env.AI_WORK_FILTER_TIMEOUT_MS || 90_000));
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "你只输出可解析 JSON。" },
+          { role: "user", content: buildPromptWithFilters(keyword, works, filters) }
+        ]
+      })
+    });
+  } catch (error) {
+    console.warn("[ai-work-title-filter] request failed; continuing without AI title filtering", error);
+    return [];
+  }
 
   if (!response.ok) return [];
   const data = await response.json().catch(() => null);

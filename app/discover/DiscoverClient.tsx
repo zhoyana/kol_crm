@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
+import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 import type { DiscoveryFilterOptions, DiscoverySortBy, DouyinDiscoveryCandidate } from "@/lib/douyin-import";
 import type { DiscoveryMode, TopicCandidate } from "@/lib/crawler-tasks";
 
@@ -77,6 +78,7 @@ type CrawlerTask = {
 };
 
 type DiscoverClientProps = {
+  initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
 };
 
@@ -211,7 +213,7 @@ function preferredTopics(topics: TopicCandidate[], limit: number): string[] {
   return (scored.length ? scored : topics.map((item) => item.topic)).slice(0, limit);
 }
 
-export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
+export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: DiscoverClientProps) {
   const [keyword, setKeyword] = useState("警校生");
   const [maxNotes, setMaxNotes] = useState(20);
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>("single");
@@ -630,7 +632,7 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
       const data = await parseResponse(response);
 
       if (!response.ok) {
-        setError(data.error || "加入待复筛池失败。");
+        setError(data.error || "加入主页样本与画像队列失败。");
         return;
       }
 
@@ -658,13 +660,15 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
 
   return (
     <div className="discover-stack">
-      <section className="panel campaign-task-picker">
+      <section className="panel campaign-task-picker workflow-section workflow-primary-section">
         <div>
+          <span className="workflow-kicker">01 · 当前品类</span>
           <h2>品类任务</h2>
           <p>先选择一个品类任务，系统会自动带入采集关键词、筛选目标、排除方向和产品卖点。</p>
         </div>
         <div className="campaign-task-picker-controls">
-          <select onChange={(event) => applyCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+          <BrandTaskPicker brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={applyCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="discover-brand-library" />
+          <select hidden onChange={(event) => applyCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
             <option value="">选择已保存任务</option>
             {campaignTasks.map((item) => (
               <option key={item.id} value={item.id}>
@@ -695,8 +699,9 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
         ) : null}
       </section>
 
-      <section className="panel discover-search-panel">
+      <section className="panel discover-search-panel workflow-section workflow-action-section">
         <div>
+          <span className="workflow-kicker">02 · 开始发现</span>
           <h2>抖音关键词发现</h2>
           <p>先用关键词和话题采集作品，再筛出近6个月点赞500+作品对应的作者。</p>
         </div>
@@ -704,7 +709,7 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
           <textarea onChange={(event) => setKeyword(event.target.value)} placeholder={"例如：警校生\n警校生日常\n藏蓝青春"} rows={2} value={keyword} />
           <input min={10} max={300} onChange={(event) => setMaxNotes(Number(event.target.value))} title="每个关键词采集数量" type="number" value={maxNotes} />
           <select disabled value={discoveryMode}>
-            <option value="single">关键词采集 + AI筛选</option>
+            <option value="single">关键词作品采集 + 聚合</option>
           </select>
           <button disabled={loading !== "" || isTaskActive} onClick={startCrawler} type="button">
             {loading === "crawl" || task?.status === "running" ? "采集中..." : "启动采集"}
@@ -718,9 +723,10 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
         </div>
       </section>
 
-      <section className="panel discovery-rule-panel">
+      <section className="panel discovery-rule-panel workflow-section workflow-settings-section">
         <div className="panel-header">
           <div>
+            <span className="workflow-kicker">03 · 筛选设置</span>
             <h2>筛选规则</h2>
             <p>查询候选时生效：先按发布时间过滤，再交给 AI 判断标题是否值得进入候选。</p>
           </div>
@@ -759,7 +765,7 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
       </section>
 
       {task ? (
-        <section className="panel crawler-status">
+        <section className="panel crawler-status workflow-section workflow-status-section">
           <div className="crawler-status-head">
             <div>
               <strong>采集任务：{statusText(task)}</strong>
@@ -825,12 +831,13 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
       {clearResult ? <p className="result-box">{clearResult}</p> : null}
 
       {result ? (
-        <section className="panel">
+        <section className="panel workflow-section workflow-results-section">
           <div className="panel-header">
             <div>
+              <span className="workflow-kicker">04 · 候选结果</span>
               <h2>达人待选候选</h2>
               <p>
-                找到 {result.total} 个新候选，已选择 {selectedIds.length} 个。当前会自动隐藏已经进入待复筛、待选、精选、跳过和已排除的达人。
+                找到 {result.total} 个新候选，已选择 {selectedIds.length} 个。当前会自动隐藏已经进入样本/画像队列、待选、精选、跳过和已排除的达人。
               </p>
               {result.stats ? (
                 <p>
@@ -846,7 +853,7 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
                 全选
               </button>
               <button disabled={!selectedCandidates.length || loading !== ""} onClick={importSelected} type="button">
-                {loading === "import" ? "加入中..." : "加入待复筛池"}
+                {loading === "import" ? "加入中..." : "加入主页样本与画像队列"}
               </button>
             </div>
           </div>
@@ -865,12 +872,12 @@ export function DiscoverClient({ initialCampaignTasks }: DiscoverClientProps) {
 
           {importResult ? (
             <div className="result-box discover-result">
-              <strong>已加入待复筛池</strong>
+              <strong>已加入主页样本与画像队列</strong>
               <p>
                 新增 {importResult.imported} 条，更新 {importResult.updated} 条，跳过 {importResult.skipped} 条。
               </p>
               {importResult.errors.length ? <p>{importResult.errors.slice(0, 3).join("；")}</p> : null}
-              <Link href="/review">去达人复筛</Link>
+              <Link href="/review">去补齐样本与数据筛选</Link>
             </div>
           ) : null}
 

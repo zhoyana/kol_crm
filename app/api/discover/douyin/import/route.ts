@@ -1,11 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importDouyinCandidates, toImportCandidate, type DouyinDiscoveryCandidate } from "@/lib/douyin-import";
-
-async function getPrisma(): Promise<any> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => any;
-  return new PrismaClient();
-}
+import { prisma } from "@/lib/prisma";
 
 function normalizeCampaignTaskId(value: unknown): number | null {
   const id = Number(value);
@@ -17,7 +12,7 @@ async function linkCreatorsToCampaignTask(candidates: DouyinDiscoveryCandidate[]
   const externalIds = Array.from(new Set(candidates.map((candidate) => candidate.externalId).filter(Boolean)));
   if (!externalIds.length) return 0;
 
-  const prisma = await getPrisma();
+  // prisma singleton from import
 
   try {
     const campaignTask = await prisma.campaignTask.findUnique({
@@ -37,6 +32,7 @@ async function linkCreatorsToCampaignTask(candidates: DouyinDiscoveryCandidate[]
 
     let linked = 0;
     for (const creator of creators) {
+      if (!creator.externalId) continue;
       const candidate = candidateMap.get(creator.externalId);
       await prisma.creatorCampaignTask.upsert({
         where: {
@@ -47,7 +43,7 @@ async function linkCreatorsToCampaignTask(candidates: DouyinDiscoveryCandidate[]
         },
         update: {
           poolStatus: "pending_review",
-          screeningStatus: "content_passed",
+          screeningStatus: "homepage_sample_pending",
           screeningSummary: candidate?.screeningSummary || null,
           notes: candidate?.notes || null
         },
@@ -55,7 +51,7 @@ async function linkCreatorsToCampaignTask(candidates: DouyinDiscoveryCandidate[]
           creatorId: creator.id,
           campaignTaskId,
           poolStatus: "pending_review",
-          screeningStatus: "content_passed",
+          screeningStatus: "homepage_sample_pending",
           fitScore: 0,
           screeningSummary: candidate?.screeningSummary || null,
           notes: candidate?.notes || null
@@ -66,7 +62,7 @@ async function linkCreatorsToCampaignTask(candidates: DouyinDiscoveryCandidate[]
 
     return linked;
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }
 
@@ -87,8 +83,8 @@ export async function POST(request: NextRequest) {
     const pendingReviewCandidates = candidates.map((candidate) => ({
       ...toImportCandidate(candidate),
       poolStatus: "pending_review",
-      screeningStatus: "content_passed",
-      screeningSummary: `${candidate.screeningSummary || "内容初筛通过"}；等待主页最近作品复筛`
+      screeningStatus: "homepage_sample_pending",
+      screeningSummary: `${candidate.screeningSummary || "作品聚合完成"}；等待补齐统一主页样本并执行 AI 作品画像初筛`
     }));
 
     const result = await importDouyinCandidates(pendingReviewCandidates);
@@ -97,6 +93,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ ...result, campaignTaskId, campaignTaskLinked });
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
-    return NextResponse.json({ error: `加入待复筛池失败：${message}` }, { status: 500 });
+    return NextResponse.json({ error: `建立画像队列失败：${message}` }, { status: 500 });
   }
 }

@@ -8,3 +8,10 @@ dist
 *.log
 tsconfig.tsbuildinfo
 .npm-cache
+backups/
+.next-dev-*/
+.next-dev.old-*/
+.sheet-work/
+.workbuddy/
+__pycache__/
+*.pyc

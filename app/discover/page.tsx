@@ -1,36 +1,14 @@
 import Link from "next/link";
-import { getCampaignTasks } from "@/lib/campaign-tasks";
+import { getBrandLibraries, getCampaignTasks } from "@/lib/campaign-tasks";
 import { DiscoverClient } from "./DiscoverClient";
 
 export const dynamic = "force-dynamic";
 
 export default async function DiscoverPage() {
-  const campaignTasks = await getCampaignTasks();
+  const [campaignTasks, brandLibraries] = await Promise.all([getCampaignTasks(), getBrandLibraries()]);
 
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">K</div>
-          <div>
-            <strong>KOL CRM</strong>
-            <span>达人筛选工作台</span>
-          </div>
-        </div>
-        <nav>
-          <Link href="/agent">筛选 Agent</Link>
-          <Link href="/">仪表盘</Link>
-          <a className="active">达人发现</a>
-          <Link href="/review">达人复筛</Link>
-          <Link href="/creators">达人库</Link>
-          <Link href="/tasks">建联任务</Link>
-          <Link href="/import">导入 CSV</Link>
-          <a>投放项目</a>
-          <a>预算复盘</a>
-        </nav>
-      </aside>
-
-      <section className="content">
+    <section className="content workflow-page discover-workflow">
         <header className="topbar">
           <div>
             <h1>达人发现</h1>
@@ -41,8 +19,7 @@ export default async function DiscoverPage() {
           </Link>
         </header>
 
-        <DiscoverClient initialCampaignTasks={campaignTasks} />
+        <DiscoverClient initialBrandLibraries={brandLibraries} initialCampaignTasks={campaignTasks} />
       </section>
-    </main>
   );
 }

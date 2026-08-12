@@ -1,5 +1,4 @@
-import Link from "next/link";
-import { getCampaignTasks } from "@/lib/campaign-tasks";
+import { getBrandLibraries, getCampaignTasks } from "@/lib/campaign-tasks";
 import { getCreators } from "@/lib/creators";
 import { CreatorLibrary } from "./CreatorLibrary";
 
@@ -8,46 +7,23 @@ export const dynamic = "force-dynamic";
 export default async function CreatorsPage({ searchParams }: { searchParams?: Promise<{ campaignTaskId?: string }> }) {
   const params = await searchParams;
   const campaignTaskId = Number(params?.campaignTaskId || 0) || null;
-  const [creators, campaignTasks] = await Promise.all([getCreators(campaignTaskId), getCampaignTasks()]);
+  const [creators, campaignTasks, brandLibraries] = await Promise.all([getCreators(campaignTaskId), getCampaignTasks(), getBrandLibraries()]);
   const pendingReview = creators.filter((creator) => creator.poolStatus === "pending_review").length;
   const candidate = creators.filter((creator) => creator.poolStatus === "candidate").length;
   const featured = creators.filter((creator) => creator.poolStatus === "featured").length;
   const contacted = creators.filter((creator) => creator.outreachStatus.includes("已")).length;
 
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">K</div>
-          <div>
-            <strong>KOL CRM</strong>
-            <span>达人筛选工作台</span>
-          </div>
-        </div>
-        <nav>
-          <Link href="/agent">筛选 Agent</Link>
-          <Link href="/discover">达人发现</Link>
-          <Link href="/">仪表盘</Link>
-          <Link className="active" href="/creators">
-            达人库
-          </Link>
-          <Link href="/review">达人复筛</Link>
-          <Link href="/tasks">建联任务</Link>
-          <a>投放项目</a>
-          <a>预算复盘</a>
-        </nav>
-      </aside>
-
-      <section className="content">
+    <section className="content workflow-page creators-workflow">
         <header className="topbar">
           <div>
             <h1>达人库</h1>
-            <p>统一管理待复筛、待选库和精选库达人，后续建联优先从精选库开始。</p>
+            <p>统一管理样本/画像队列、画像通过待选库和数据达标精选库，后续建联优先从精选库开始。</p>
           </div>
           <button>新增达人</button>
         </header>
 
-        <section className="metrics">
+        <section className="metrics workflow-metrics">
           <div>
             <span>达人总数</span>
             <strong>{creators.length}</strong>
@@ -61,7 +37,7 @@ export default async function CreatorsPage({ searchParams }: { searchParams?: Pr
             <strong>{candidate}</strong>
           </div>
           <div>
-            <span>待复筛池</span>
+            <span>样本/画像队列</span>
             <strong>{pendingReview}</strong>
           </div>
           <div>
@@ -70,8 +46,7 @@ export default async function CreatorsPage({ searchParams }: { searchParams?: Pr
           </div>
         </section>
 
-        <CreatorLibrary creators={creators} initialCampaignTaskId={campaignTaskId} initialCampaignTasks={campaignTasks} />
+        <CreatorLibrary creators={creators} initialBrandLibraries={brandLibraries} initialCampaignTaskId={campaignTaskId} initialCampaignTasks={campaignTasks} />
       </section>
-    </main>
   );
 }

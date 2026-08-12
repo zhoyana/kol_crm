@@ -1,20 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importDouyinCandidates, type DouyinDiscoveryCandidate, type DouyinWork } from "@/lib/douyin-import";
-import { verifyDouyinHomepageCandidatesBatch, type HomepageReviewRules } from "@/lib/douyin-homepage";
-
-type MiniPrismaClient = {
-  creator: {
-    findMany: (args: Record<string, unknown>) => Promise<any[]>;
-    update: (args: Record<string, unknown>) => Promise<any>;
-  };
-  campaignTask: {
-    findUnique: (args: Record<string, unknown>) => Promise<any | null>;
-  };
-  creatorCampaignTask: {
-    upsert: (args: Record<string, unknown>) => Promise<any>;
-  };
-  $disconnect: () => Promise<void>;
-};
+import {
+  applyHomepageMetricRules,
+  verifyDouyinHomepageCandidatesBatch,
+  type HomepageReviewRules
+} from "@/lib/douyin-homepage";
+import { prisma } from "@/lib/prisma";
 
 type BatchResult = {
   id: number;
@@ -27,13 +18,14 @@ type BatchResult = {
   screeningSummary?: string;
   message?: string;
   error?: string;
+  avgLikes?: number;
+  maxLikes?: number;
+  recentWorkCount?: number;
+  viralWorkCount?: number;
+  sampleWorkCount?: number;
+  aiCalls?: number;
+  wasFeatured?: boolean;
 };
-
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
-}
 
 function normalizeWorks(works: any[]): DouyinWork[] {
   return works.map((work) => ({
@@ -100,9 +92,12 @@ function toReviewCandidate(row: any): DouyinDiscoveryCandidate {
 }
 
 function idFilters(ids: string[]): Record<string, unknown>[] {
-  return ids.flatMap((id) => {
-    const numericId = Number(id);
-    return [{ externalId: id }, ...(Number.isInteger(numericId) ? [{ id: numericId }] : [])];
+  return ids.map((id) => {
+    if (id.startsWith("db:")) {
+      const numericId = Number(id.slice(3));
+      return Number.isInteger(numericId) ? { id: numericId } : { externalId: id };
+    }
+    return { externalId: id };
   });
 }
 
@@ -123,11 +118,13 @@ function toHomepageCampaignTask(task: any): HomepageReviewRules["campaignTask"] 
     seedKeywords: Array.isArray(task.seedKeywords) ? task.seedKeywords : [],
     excludeKeywords: Array.isArray(task.excludeKeywords) ? task.excludeKeywords : [],
     productSellingPoints: Array.isArray(task.productSellingPoints) ? task.productSellingPoints : [],
-    outreachTone: task.outreachTone || null
+    outreachTone: task.outreachTone || null,
+    audienceTemplateId: task.audienceTemplateId ?? null,
+    audienceTemplateSnapshot: (task as any).audienceTemplateSnapshot ?? null
   };
 }
 
-async function writeCampaignReviewResult(prisma: MiniPrismaClient, creatorId: number, campaignTaskId: number | null, result: {
+async function writeCampaignReviewResult(prisma: any, creatorId: number, campaignTaskId: number | null, result: {
   poolStatus: string;
   screeningStatus: string;
   screeningSummary?: string | null;
@@ -172,13 +169,14 @@ export async function POST(request: NextRequest) {
     allowFullRetry?: boolean;
     skipObviousMismatch?: boolean;
     campaignTaskId?: number | string | null;
+    mode?: "portrait" | "metrics";
   } | null;
   const ids = (body?.ids || []).map((id) => String(id).trim()).filter(Boolean).slice(0, 30);
   if (!ids.length) {
-    return NextResponse.json({ error: "请选择要批量复筛的达人。" }, { status: 400 });
+    return NextResponse.json({ error: "请选择要处理的达人。" }, { status: 400 });
   }
 
-  const prisma = await getPrisma();
+  // prisma singleton from import
 
   try {
     const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
@@ -199,12 +197,71 @@ export async function POST(request: NextRequest) {
     });
 
     if (!rows.length) {
-      return NextResponse.json({ error: "没有找到待复筛达人。" }, { status: 404 });
+      return NextResponse.json({ error: "没有找到待处理达人。" }, { status: 404 });
     }
 
     const candidates = rows.map(toReviewCandidate);
+    const mode = body?.mode === "portrait" ? "portrait" : "metrics";
+
+    if (mode === "metrics") {
+      const metricCandidates = candidates.map((candidate) => applyHomepageMetricRules(candidate, rules));
+      const results: BatchResult[] = [];
+      const existingLinks = campaignTaskId
+        ? await prisma.creatorCampaignTask.findMany({
+            where: { campaignTaskId, creatorId: { in: rows.map((row) => row.id) } },
+            select: { creatorId: true, poolStatus: true }
+          })
+        : [];
+      const previousPoolByCreatorId = new Map(
+        existingLinks.map((link) => [link.creatorId, link.poolStatus])
+      );
+
+      for (const row of rows) {
+        const externalId = row.externalId || `douyin-${row.id}`;
+        const candidate = metricCandidates.find((item) => item.externalId === externalId);
+        if (!candidate) {
+          results.push({ id: row.id, externalId, name: row.name, ok: false, error: "没有生成数据门槛结果" });
+          continue;
+        }
+        await writeCampaignReviewResult(prisma, row.id, campaignTaskId, {
+          poolStatus: candidate.poolStatus,
+          screeningStatus: candidate.screeningStatus,
+          screeningSummary: candidate.screeningSummary,
+          notes: candidate.notes
+        });
+        results.push({
+          id: row.id,
+          externalId,
+          name: row.name,
+          ok: true,
+          wasFeatured: previousPoolByCreatorId.get(row.id) === "featured",
+          poolStatus: candidate.poolStatus,
+          screeningStatus: candidate.screeningStatus,
+          screeningSummary: candidate.screeningSummary || "",
+          avgLikes: candidate.avgLikes,
+          maxLikes: candidate.maxLikes,
+          recentWorkCount: candidate.recentWorkCount,
+          viralWorkCount: candidate.viralWorkCount,
+          sampleWorkCount: candidate.works.length
+        });
+      }
+
+      if (metricCandidates.length) await importDouyinCandidates(metricCandidates);
+      return NextResponse.json({
+        ok: true,
+        mode,
+        total: results.length,
+        succeeded: results.filter((item) => item.ok).length,
+        featured: results.filter((item) => item.poolStatus === "featured").length,
+        candidate: results.filter((item) => item.poolStatus === "candidate").length,
+        skipped: 0,
+        failed: results.filter((item) => item.error).length,
+        results
+      });
+    }
+
     const reviewResults = await verifyDouyinHomepageCandidatesBatch(candidates, rules, {
-      workLimit: body?.workLimit || 3,
+      workLimit: body?.workLimit || 10,
       allowFullRetry: body?.allowFullRetry ?? true,
       skipObviousMismatch: body?.skipObviousMismatch ?? true
     });
@@ -216,25 +273,39 @@ export async function POST(request: NextRequest) {
       const externalId = row.externalId || `douyin-${row.id}`;
       const result = resultMap.get(externalId);
       if (!result) {
-        results.push({ id: row.id, externalId, name: row.name, ok: false, error: "没有拿到复筛结果" });
+        results.push({ id: row.id, externalId, name: row.name, ok: false, error: "没有拿到作品画像结果" });
         continue;
       }
 
       if (!result.ok) {
+        const dataIncomplete = /采集失败|未读取到|缺少 sec_uid|无法复筛|画像处理失败/.test(result.reason);
+        const nextPoolStatus = dataIncomplete ? "pending_review" : "rejected";
+        const nextScreeningStatus = dataIncomplete ? "portrait_data_incomplete" : "portrait_rejected";
         await prisma.creator.update({
           where: { id: row.id },
           data: {
-            poolStatus: "skipped",
-            screeningStatus: "inactive_or_failed",
-            screeningSummary: result.reason
+            poolStatus: nextPoolStatus,
+            screeningStatus: nextScreeningStatus,
+            screeningSummary: result.reason,
+            rejectReason: dataIncomplete ? null : result.reason
           }
         });
         await writeCampaignReviewResult(prisma, row.id, campaignTaskId, {
-          poolStatus: "skipped",
-          screeningStatus: "inactive_or_failed",
+          poolStatus: nextPoolStatus,
+          screeningStatus: nextScreeningStatus,
           screeningSummary: result.reason
         });
-        results.push({ id: row.id, externalId, name: row.name, ok: false, skipped: true, message: result.reason });
+        results.push({
+          id: row.id,
+          externalId,
+          name: row.name,
+          ok: false,
+          skipped: !dataIncomplete,
+          poolStatus: nextPoolStatus,
+          screeningStatus: nextScreeningStatus,
+          message: result.reason,
+          aiCalls: Number(result.aiCalls || 0)
+        });
         continue;
       }
 
@@ -251,7 +322,13 @@ export async function POST(request: NextRequest) {
         ok: true,
         poolStatus: result.candidate.poolStatus,
         screeningStatus: result.candidate.screeningStatus,
-        screeningSummary: result.candidate.screeningSummary || ""
+        screeningSummary: result.candidate.screeningSummary || "",
+        avgLikes: result.candidate.avgLikes,
+        maxLikes: result.candidate.maxLikes,
+        recentWorkCount: result.candidate.recentWorkCount,
+        viralWorkCount: result.candidate.viralWorkCount,
+        sampleWorkCount: result.candidate.works.length,
+        aiCalls: Number(result.aiCalls || 0)
       });
     }
 
@@ -261,13 +338,19 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       ok: true,
+      mode,
       total: results.length,
       succeeded: results.filter((item) => item.ok).length,
       skipped: results.filter((item) => item.skipped).length,
       failed: results.filter((item) => item.error).length,
+      aiCalls: results.reduce((sum, item) => sum + Number(item.aiCalls || 0), 0),
       results
     });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    console.error("[review/douyin/batch] 执行失败：", error);
+    return NextResponse.json({ error: `主页画像批次失败：${message}` }, { status: 500 });
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }

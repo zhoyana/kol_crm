@@ -1,3 +1,5 @@
+import { prisma as prismaSingleton } from "./prisma";
+
 export type ReviewCreator = {
   id: number;
   campaignTaskId?: number | null;
@@ -7,11 +9,14 @@ export type ReviewCreator = {
   platform: string;
   profileUrl: string;
   category: string;
+  poolStatus: string;
+  screeningStatus: string;
   screeningSummary: string;
   avgLikes: number;
   maxLikes: number;
   recentWorkCount: number;
   viralWorkCount: number;
+  sampleWorkCount: number;
   updatedAt: string;
 };
 
@@ -29,9 +34,7 @@ type MiniPrismaClient = {
 };
 
 async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
+  return prismaSingleton as unknown as MiniPrismaClient;
 }
 
 function splitTerms(values: string[]): string[] {
@@ -100,8 +103,15 @@ function summaryForTask(summary: string, task: any): string {
   return `已进入「${task.name || "当前品类任务"}」待复筛池，等待按当前任务重新抓取主页作品并复筛。`;
 }
 
+function normalizedQueuePoolStatus(poolStatus: string, screeningStatus: string): string {
+  if (poolStatus === "candidate" && screeningStatus !== "portrait_passed") return "pending_review";
+  return poolStatus;
+}
+
 function toReviewCreatorFromLink(row: any): ReviewCreator {
   const summary = row.screeningSummary || row.creator.screeningSummary || "";
+  const screeningStatus = row.screeningStatus || row.creator.screeningStatus || "homepage_sample_pending";
+  const poolStatus = normalizedQueuePoolStatus(row.poolStatus || row.creator.poolStatus || "pending_review", screeningStatus);
   return {
     id: row.creator.id,
     campaignTaskId: row.campaignTaskId,
@@ -111,17 +121,22 @@ function toReviewCreatorFromLink(row: any): ReviewCreator {
     platform: row.creator.platform,
     profileUrl: row.creator.profileUrl || "",
     category: row.campaignTask?.category || row.creator.category || "未分类",
+    poolStatus,
+    screeningStatus,
     screeningSummary: summaryForTask(summary, row.campaignTask),
     avgLikes: row.creator.avgLikes || 0,
     maxLikes: row.creator.maxLikes || 0,
     recentWorkCount: row.creator.recentWorkCount || 0,
     viralWorkCount: row.creator.viralWorkCount || 0,
+    sampleWorkCount: row.creator._count?.works || 0,
     updatedAt: row.updatedAt.toISOString()
   };
 }
 
 function toReviewCreatorFromGlobal(row: any, campaignTaskId: number | null = null, campaignTaskName = "", campaignTask: any = null): ReviewCreator {
   const summary = row.screeningSummary || "";
+  const screeningStatus = row.screeningStatus || "homepage_sample_pending";
+  const poolStatus = normalizedQueuePoolStatus(row.poolStatus || "pending_review", screeningStatus);
   return {
     id: row.id,
     campaignTaskId,
@@ -131,11 +146,14 @@ function toReviewCreatorFromGlobal(row: any, campaignTaskId: number | null = nul
     platform: row.platform,
     profileUrl: row.profileUrl || "",
     category: campaignTask?.category || row.category || "未分类",
+    poolStatus,
+    screeningStatus,
     screeningSummary: summaryForTask(summary, campaignTask),
     avgLikes: row.avgLikes || 0,
     maxLikes: row.maxLikes || 0,
     recentWorkCount: row.recentWorkCount || 0,
     viralWorkCount: row.viralWorkCount || 0,
+    sampleWorkCount: row._count?.works || 0,
     updatedAt: row.updatedAt.toISOString()
   };
 }
@@ -153,24 +171,31 @@ export async function getPendingReviewCreators(campaignTaskId?: number | null): 
         prisma.creatorCampaignTask.findMany({
           where: {
             campaignTaskId,
-            poolStatus: "pending_review"
+            poolStatus: { in: ["pending_review", "candidate"] }
           },
           include: {
             campaignTask: true,
-            creator: true
+            creator: {
+              include: {
+                _count: { select: { works: true } }
+              }
+            }
           },
           orderBy: [{ updatedAt: "desc" }],
           take: 80
         }),
         prisma.creator.findMany({
           where: {
-            poolStatus: "pending_review",
+            poolStatus: { in: ["pending_review", "candidate"] },
             campaignTasks: {
               none: {
                 campaignTaskId,
-                poolStatus: "pending_review"
+                poolStatus: { in: ["pending_review", "candidate"] }
               }
             }
+          },
+          include: {
+            _count: { select: { works: true } }
           },
           orderBy: [{ updatedAt: "desc" }],
           take: 120
@@ -192,7 +217,10 @@ export async function getPendingReviewCreators(campaignTaskId?: number | null): 
 
     const rows = await prisma.creator.findMany({
         where: {
-          poolStatus: "pending_review"
+          poolStatus: { in: ["pending_review", "candidate"] }
+        },
+        include: {
+          _count: { select: { works: true } }
         },
         orderBy: [{ updatedAt: "desc" }],
         take: 80
@@ -200,6 +228,6 @@ export async function getPendingReviewCreators(campaignTaskId?: number | null): 
 
     return rows.map((row) => toReviewCreatorFromGlobal(row));
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }

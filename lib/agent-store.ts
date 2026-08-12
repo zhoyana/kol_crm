@@ -1,3 +1,5 @@
+import { prisma as prismaSingleton } from "./prisma";
+
 export type ScreeningRuleProfileItem = {
   id: number;
   name: string;
@@ -68,9 +70,7 @@ function toRuleProfile(row: any): ScreeningRuleProfileItem {
 }
 
 async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
+  return prismaSingleton as unknown as MiniPrismaClient;
 }
 
 export async function getRuleProfiles(): Promise<ScreeningRuleProfileItem[]> {
@@ -87,7 +87,7 @@ export async function getRuleProfiles(): Promise<ScreeningRuleProfileItem[]> {
 
       return rows.map(toRuleProfile);
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch {
     return [];

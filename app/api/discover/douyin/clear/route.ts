@@ -1,19 +1,7 @@
 import { readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
-
-type MiniPrismaClient = {
-  creatorWork: {
-    deleteMany: (args?: any) => Promise<{ count: number }>;
-  };
-  $disconnect: () => Promise<void>;
-};
-
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await import("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
-}
+import { prisma } from "@/lib/prisma";
 
 function douyinJsonlDir(): string {
   return path.resolve(process.cwd(), "..", "MediaCrawler-main", "data", "douyin", "jsonl");
@@ -35,12 +23,12 @@ export async function POST() {
   let deletedWorks = 0;
 
   if (process.env.DATABASE_URL) {
-    const prisma = await getPrisma();
+    // prisma singleton from import
     try {
       const result = await prisma.creatorWork.deleteMany();
       deletedWorks = result.count;
-    } finally {
-      await prisma.$disconnect();
+    } catch {
+      // ignore deletion errors
     }
   }
 

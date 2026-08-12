@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { csvRowsToObjects, numberValue } from "./csv";
+import { prisma as prismaSingleton } from "./prisma";
 
 export type CreatorPoolStatus = "pending_review" | "candidate" | "featured" | "skipped" | "rejected" | string;
 
@@ -144,9 +145,7 @@ function buildCreator(input: {
 }
 
 async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
+  return prismaSingleton as unknown as MiniPrismaClient;
 }
 
 export async function getCreators(campaignTaskId?: number | null): Promise<Creator[]> {
@@ -228,7 +227,7 @@ async function getCreatorsFromDatabase(campaignTaskId?: number | null): Promise<
         })
       );
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch {
     return [];
@@ -298,7 +297,7 @@ export async function getOutreachLogsByCreatorId(id: string): Promise<OutreachLo
         })) ?? []
       );
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch {
     return [];

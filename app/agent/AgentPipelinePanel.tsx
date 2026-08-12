@@ -101,7 +101,7 @@ export function AgentPipelinePanel({ task }: { task: CampaignTaskItem }) {
       body: JSON.stringify({
         keyword,
         campaignTaskId: task.id,
-        maxNotes: 100,
+        maxNotes: 50,
         discoveryMode: "single",
         topicLimit: 3,
         publishWindowDays: 180,

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateAiOutreachScript, type AiProvider, type OutreachCampaignTask } from "@/lib/outreach-script";
 import type { Creator } from "@/lib/creators";
+import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
@@ -117,8 +118,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-    const prisma = new prismaModule.PrismaClient();
+    // prisma singleton from import
     const numericId = Number(creatorId);
 
     try {
@@ -145,7 +145,9 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "没有找到达人。" }, { status: 404 });
       }
 
-      const linkedTask = campaignTaskId ? creatorRow.campaignTasks?.[0] : null;
+      const linkedTask = campaignTaskId
+        ? (creatorRow.campaignTasks?.[0] as (typeof creatorRow.campaignTasks)[number] & { campaignTask: any } | undefined)
+        : null;
       const campaignTask = linkedTask?.campaignTask
         ? buildCampaignTask(linkedTask.campaignTask)
         : campaignTaskId
@@ -172,7 +174,7 @@ export async function POST(request: NextRequest) {
 
       return NextResponse.json(result);
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";

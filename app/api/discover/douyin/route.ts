@@ -9,18 +9,12 @@ import {
 } from "@/lib/douyin-import";
 import { filterCandidatesByAiWorkTitles } from "@/lib/ai-work-title-filter";
 import { getDouyinCrawlerTask } from "@/lib/crawler-tasks";
+import { prisma } from "@/lib/prisma";
 
 type DiscoveryStats = {
   rawCandidateCount: number;
   hiddenExistingCount: number;
   newCandidateCount: number;
-};
-
-type MiniPrismaClient = {
-  creator: {
-    findMany: (args: any) => Promise<Array<{ externalId: string | null; profileUrl: string | null }>>;
-  };
-  $disconnect: () => Promise<void>;
 };
 
 async function prepareCandidates(keyword: string, rawCandidates: Awaited<ReturnType<typeof searchDouyinResultFiles>>["candidates"], filters: DiscoveryFilterOptions) {
@@ -34,17 +28,11 @@ async function prepareCandidates(keyword: string, rawCandidates: Awaited<ReturnT
 
   return candidates.map((candidate) => ({
     ...candidate,
-    screeningStatus: candidate.rejectReason ? candidate.screeningStatus : "candidate_observe",
+    screeningStatus: candidate.rejectReason ? candidate.screeningStatus : "work_samples_collected",
     screeningSummary: candidate.rejectReason
       ? candidate.screeningSummary
-      : "内容初筛通过：LLM 已根据搜索结果视频标题判断；这里只代表样本视频，不代表达人主页整体数据，后续需要进入主页复筛。"
+      : "关键词作品样本已聚合；这里只代表搜索命中的作品，不代表达人主页整体画像，后续需要补齐统一主页样本并执行品类 AI 画像。"
   }));
-}
-
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
 }
 
 function normalizeKey(value: string | null | undefined): string {
@@ -84,7 +72,7 @@ async function hideExistingCreators(
   const profileUrls = Array.from(new Set(candidates.map((candidate) => candidate.profileUrl).filter(Boolean))) as string[];
   if (!externalIds.length && !profileUrls.length) return { candidates, stats: emptyStats };
 
-  const prisma = await getPrisma();
+  // prisma singleton from import
   try {
     const rows = await prisma.creator.findMany({
       where: {
@@ -114,7 +102,7 @@ async function hideExistingCreators(
       }
     };
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }
 

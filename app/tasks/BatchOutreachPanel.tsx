@@ -189,19 +189,6 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     return true;
   }
 
-  async function recordSent(candidate: BatchCandidate, script: string): Promise<boolean> {
-    const response = await fetch(`/api/creators/${encodeURIComponent(candidate.creatorId)}/status`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        outreachStatus: "已建联",
-        action: "batch_auto_send_douyin_message",
-        content: `批量自动建联已向 ${candidate.creatorName} 发送私信。\n\n话术：${script}`
-      })
-    });
-    return response.ok;
-  }
-
   async function sendCandidates(queue: BatchCandidate[] = selectedCandidates) {
     const prepared = queue.filter((candidate) => (itemsRef.current[candidate.creatorId]?.script || candidate.defaultScript).trim());
     if (!prepared.length) {
@@ -232,7 +219,12 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
         const response = await fetch("/api/outreach/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ profileUrl: candidate.profileUrl, message: script })
+          body: JSON.stringify({
+            creatorId: candidate.creatorId,
+            profileUrl: candidate.profileUrl,
+            message: script,
+            taskKind: candidate.taskKind
+          })
         });
         const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
         if (!response.ok || !result.ok) {
@@ -242,17 +234,8 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
             message: result.error || "发送失败，未标记为已建联。"
           });
         } else {
-          const recorded = await recordSent(candidate, script);
-          if (!recorded) {
-            failed += 1;
-            updateItem(candidate.creatorId, {
-              status: "failed",
-              message: "私信已发送，但CRM状态记录失败，请人工确认。"
-            });
-          } else {
-            sent += 1;
-            updateItem(candidate.creatorId, { status: "sent", message: "已发送并记录。" });
-          }
+          sent += 1;
+          updateItem(candidate.creatorId, { status: "sent", message: "已发送并标记为已建联。" });
         }
       } catch {
         failed += 1;
@@ -293,9 +276,10 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
   }
 
   return (
-    <section className="panel batch-outreach-panel">
+    <section className="panel batch-outreach-panel workflow-section workflow-action-section">
       <div className="panel-header">
         <div>
+          <span className="workflow-kicker">02 · 批量执行</span>
           <h2>批量个性化建联</h2>
           <p>每批最多5人。先由AI逐人生成话术并检查，再确认顺序发送。</p>
         </div>

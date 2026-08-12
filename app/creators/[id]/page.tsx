@@ -1,8 +1,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { formatNumber, generateOutreachScript, getCreatorById, getCreators, getOutreachLogsByCreatorId } from "@/lib/creators";
+import { formatNumber, generateOutreachScript, getCreatorById, getOutreachLogsByCreatorId } from "@/lib/creators";
 import { AiEvaluationPanel } from "./AiEvaluationPanel";
 import { CreatorProfileEditor } from "./CreatorProfileEditor";
+
+export const dynamic = "force-dynamic";
 
 type PageProps = {
   params: Promise<{
@@ -40,13 +42,6 @@ function formatDateTime(value: string) {
   }).format(new Date(value));
 }
 
-export async function generateStaticParams() {
-  const creators = await getCreators();
-  return creators.map((creator) => ({
-    id: creator.id
-  }));
-}
-
 export default async function CreatorDetailPage({ params }: PageProps) {
   const { id } = await params;
   const creator = await getCreatorById(id);
@@ -62,28 +57,7 @@ export default async function CreatorDetailPage({ params }: PageProps) {
     creator.currentCpm == null ? "暂无报价" : creator.currentCpm > 20 ? "报价偏高" : creator.currentCpm <= 15 ? "价格友好" : "可谈";
 
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">K</div>
-          <div>
-            <strong>KOL CRM</strong>
-            <span>达人筛选工作台</span>
-          </div>
-        </div>
-        <nav>
-          <Link href="/discover">达人发现</Link>
-          <Link href="/">仪表盘</Link>
-          <Link href="/creators">达人库</Link>
-          <a className="active">达人详情</a>
-          <Link href="/tasks">建联任务</Link>
-          <Link href="/import">导入 CSV</Link>
-          <a>投放项目</a>
-          <a>预算复盘</a>
-        </nav>
-      </aside>
-
-      <section className="content">
+    <section className="content">
         <header className="topbar">
           <div>
             <Link className="back-link" href="/creators">
@@ -246,6 +220,5 @@ export default async function CreatorDetailPage({ params }: PageProps) {
           )}
         </section>
       </section>
-    </main>
   );
 }

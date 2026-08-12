@@ -13,6 +13,7 @@ export async function POST(request: NextRequest) {
     publishWindowDays?: number;
     sortBy?: string;
     topicRules?: TopicRuleOptions;
+    restartCdpBeforeSpawn?: boolean;
   } | null;
 
   try {
@@ -23,7 +24,8 @@ export async function POST(request: NextRequest) {
       topicLimit: body?.topicLimit || 3,
       publishWindowDays: body?.publishWindowDays,
       sortBy: body?.sortBy,
-      topicRules: body?.topicRules
+      topicRules: body?.topicRules,
+      restartCdpBeforeSpawn: body?.restartCdpBeforeSpawn
     });
 
     return NextResponse.json(task);

@@ -5,6 +5,7 @@ import {
   type DiscoveryCampaignTask,
   type DiscoveryRuleTemplate
 } from "@/lib/discovery-rule-templates";
+import { prisma } from "@/lib/prisma";
 
 type TopicRulesRequest = {
   keyword?: string;
@@ -22,13 +23,25 @@ function normalizeTaskId(value: unknown): number | null {
 
 async function loadCampaignTask(id: number | null): Promise<DiscoveryCampaignTask | null> {
   if (!id || !process.env.DATABASE_URL) return null;
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => any;
-  const prisma = new PrismaClient();
+  // prisma singleton from import
   try {
-    return await prisma.campaignTask.findUnique({ where: { id } });
-  } finally {
-    await prisma.$disconnect();
+    const task = await prisma.campaignTask.findUnique({ where: { id } });
+    if (!task) return null;
+    const strings = (value: unknown) => Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+    return {
+      name: task.name,
+      productName: task.productName,
+      category: task.category,
+      targetAudience: task.targetAudience,
+      targetDescription: task.targetDescription,
+      seedKeywords: strings(task.seedKeywords),
+      excludeKeywords: strings(task.excludeKeywords),
+      productSellingPoints: strings(task.productSellingPoints),
+      audienceTemplateId: task.audienceTemplateId,
+      audienceTemplateSnapshot: task.audienceTemplateSnapshot
+    };
+  } catch {
+    return null;
   }
 }
 

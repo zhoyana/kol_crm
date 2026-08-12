@@ -1,7 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
+import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
+import { resolveDiscoveryRuleTemplate } from "@/lib/discovery-rule-templates";
 import type { ReviewCreator } from "@/lib/review";
 import type { HomepageReviewRules } from "@/lib/douyin-homepage";
 
@@ -14,6 +16,11 @@ type ReviewResult = {
   screeningStatus?: string;
   screeningSummary?: string;
   error?: string;
+  avgLikes?: number;
+  maxLikes?: number;
+  recentWorkCount?: number;
+  viralWorkCount?: number;
+  sampleWorkCount?: number;
 };
 
 type BatchReviewResponse = {
@@ -28,8 +35,6 @@ type BatchReviewResponse = {
 
 type ReviewRunOptions = {
   keepRunningState?: boolean;
-  workLimit?: number;
-  allowFullRetry?: boolean;
 };
 
 function formatNumber(value: number): string {
@@ -37,12 +42,17 @@ function formatNumber(value: number): string {
 }
 
 function statusLabel(status?: string): string {
+  if (status === "homepage_sample_pending") return "等待补齐主页样本";
+  if (status === "portrait_passed") return "AI画像通过：待选库";
+  if (status === "portrait_insufficient") return "AI画像：信息不足";
+  if (status === "portrait_data_incomplete") return "主页样本不完整";
+  if (status === "portrait_rejected") return "AI画像排除";
   if (status === "featured_stable") return "精选库：稳定优质";
   if (status === "featured_trending") return "精选库：近期流量好";
   if (status === "candidate_potential") return "待选库：潜力观察";
   if (status === "candidate_observe") return "待选库：普通观察";
   if (status === "inactive_or_failed") return "跳过";
-  return status || "待复筛";
+  return status || "等待处理";
 }
 
 function resultTone(result?: ReviewResult): string {
@@ -71,7 +81,9 @@ function isPriorityCreator(creator: ReviewCreator): boolean {
 }
 
 function buildBatchQueue(creators: ReviewCreator[], onlyPriorityBatch: boolean): ReviewCreator[] {
-  const sorted = [...creators].sort((a, b) => creatorPriority(b) - creatorPriority(a));
+  const sorted = creators
+    .filter((creator) => creator.poolStatus === "candidate" && creator.screeningStatus === "portrait_passed")
+    .sort((a, b) => creatorPriority(b) - creatorPriority(a));
   if (!onlyPriorityBatch) return sorted.slice(0, 30);
 
   const priorityCreators = sorted.filter(isPriorityCreator);
@@ -80,33 +92,43 @@ function buildBatchQueue(creators: ReviewCreator[], onlyPriorityBatch: boolean):
 
 type ReviewClientProps = {
   initialCreators: ReviewCreator[];
+  initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
   initialCampaignTaskId: number | null;
 };
 
-export function ReviewClient({ initialCreators, initialCampaignTasks, initialCampaignTaskId }: ReviewClientProps) {
+export function ReviewClient({ initialCreators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId }: ReviewClientProps) {
+  const initialCampaignTask = initialCampaignTasks.find((task) => task.id === initialCampaignTaskId);
+  const initialMetricRules = resolveDiscoveryRuleTemplate(initialCampaignTask).metricRules;
   const [creators, setCreators] = useState([...initialCreators].sort((a, b) => creatorPriority(b) - creatorPriority(a)));
   const [campaignTasks] = useState(initialCampaignTasks);
   const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
   const [runningId, setRunningId] = useState<number | null>(null);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [results, setResults] = useState<Record<number, ReviewResult>>({});
-  const [onlyPriorityBatch, setOnlyPriorityBatch] = useState(true);
-  const [batchWorkLimit, setBatchWorkLimit] = useState(3);
+  const [onlyPriorityBatch, setOnlyPriorityBatch] = useState(false);
   const [rules, setRules] = useState<HomepageReviewRules>({
-    requireAvgLikes500: true,
-    requireViral2000: true,
-    requireWorkCount10: false,
-    requireRecentViral: false
+    requireAvgLikes500: initialMetricRules.requireAvgLikes,
+    requireViral2000: initialMetricRules.requireViralWorks,
+    requireWorkCount10: initialMetricRules.requireSampleWorks,
+    requireRecentViral: false,
+    requireRecentUpdate: initialMetricRules.requireRecentUpdate,
+    avgLikesThreshold: initialMetricRules.avgLikesThreshold,
+    viralLikesThreshold: initialMetricRules.viralLikesThreshold,
+    minViralWorks: initialMetricRules.minViralWorks,
+    minSampleWorks: initialMetricRules.minSampleWorks,
+    metricMatchMode: initialMetricRules.matchMode
   });
 
   const selectedRuleLabels = useMemo(() => {
     const labels = [];
-    if (rules.requireAvgLikes500) labels.push("平均点赞 > 500");
-    if (rules.requireViral2000) labels.push("出现点赞 > 2000 爆款");
-    if (rules.requireWorkCount10) labels.push("作品总数 > 10");
+    if (rules.requireAvgLikes500) labels.push(`平均点赞 > ${rules.avgLikesThreshold || 500}`);
+    if (rules.requireViral2000) labels.push(`至少 ${rules.minViralWorks || 1} 条点赞 > ${rules.viralLikesThreshold || 2000}`);
+    if (rules.requireWorkCount10) labels.push(`主页样本数 ≥ ${rules.minSampleWorks || 10}`);
     if (rules.requireRecentViral) labels.push("爆款在近 1 个月内");
-    return labels.length ? labels.join(" + ") : "不设置精选条件，活跃账号都进入精选库";
+    if (rules.requireRecentUpdate) labels.push("近 1 个月有更新");
+    const separator = rules.metricMatchMode === "any" ? " 或 " : " + ";
+    return labels.length ? labels.join(separator) : "不设置数据门槛，画像通过的达人都进入精选库";
   }, [rules]);
 
   const selectedCampaignTask = useMemo(
@@ -124,32 +146,34 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
     setRules((current) => ({ ...current, [key]: !current[key] }));
   }
 
+  function setNumberRule(key: keyof HomepageReviewRules, value: number) {
+    setRules((current) => ({ ...current, [key]: Math.max(0, value) }));
+  }
+
   async function reviewCreator(creator: ReviewCreator, options: ReviewRunOptions = {}) {
-    const workLimit = options.workLimit || 6;
     if (!options.keepRunningState) setRunningId(creator.id);
     setResults((current) => ({
       ...current,
-      [creator.id]: { message: `正在抓取主页最近${workLimit}条作品${options.allowFullRetry ? "，必要时再升级10条" : ""}...` }
+      [creator.id]: { message: "正在读取已记录指标并应用数据门槛…" }
     }));
 
     try {
-      const response = await fetch(`/api/review/douyin/${encodeURIComponent(creator.externalId || String(creator.id))}`, {
+      const response = await fetch("/api/review/douyin/batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ids: [creator.externalId || String(creator.id)],
           campaignTaskId: selectedCampaignTaskId || null,
-          rules,
-          workLimit,
-          allowFullRetry: options.allowFullRetry ?? true,
-          skipObviousMismatch: true
+          rules
         })
       });
-      const data = (await response.json()) as ReviewResult;
+      const batchData = (await response.json()) as BatchReviewResponse;
+      const data = batchData.results?.[0] || { error: batchData.error };
 
       if (!response.ok) {
         setResults((current) => ({
           ...current,
-          [creator.id]: { error: data.error || "复筛失败" }
+          [creator.id]: { error: data.error || "数据门槛筛选失败" }
         }));
         return false;
       }
@@ -163,7 +187,7 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
     } catch {
       setResults((current) => ({
         ...current,
-        [creator.id]: { error: "复筛接口没有响应，请确认本地服务和 MediaCrawler 正常。" }
+        [creator.id]: { error: "数据门槛接口没有响应，请确认本地服务正常。" }
       }));
       return false;
     } finally {
@@ -180,7 +204,7 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
       setResults((current) => {
         const next = { ...current };
         for (const creator of batch) {
-          next[creator.id] = { message: `已进入批量队列：本轮抓取主页最近${batchWorkLimit}条作品...` };
+            next[creator.id] = { message: "已进入数据门槛队列，不会重新打开 Crawler。" };
         }
         return next;
       });
@@ -191,9 +215,7 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
         body: JSON.stringify({
           ids: batch.map((creator) => creator.externalId || String(creator.id)),
           campaignTaskId: selectedCampaignTaskId || null,
-          rules,
-          workLimit: batchWorkLimit,
-          skipObviousMismatch: true
+          rules
         })
       });
       const data = (await response.json()) as BatchReviewResponse;
@@ -202,7 +224,7 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
         setResults((current) => {
           const next = { ...current };
           for (const creator of batch) {
-            next[creator.id] = { error: data.error || "批量复筛失败" };
+            next[creator.id] = { error: data.error || "批量数据门槛筛选失败" };
           }
           return next;
         });
@@ -225,26 +247,95 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
     }
   }
 
+  async function profileCreators(targets: ReviewCreator[]) {
+    if (!targets.length) return;
+    setIsBatchRunning(true);
+    setRunningId(null);
+    setResults((current) => {
+      const next = { ...current };
+      for (const creator of targets) next[creator.id] = { message: "正在补齐主页样本并执行 AI 作品画像…" };
+      return next;
+    });
+
+    try {
+      const response = await fetch("/api/review/douyin/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "portrait",
+          ids: targets.map((creator) => creator.externalId || String(creator.id)),
+          campaignTaskId: selectedCampaignTaskId || null,
+          workLimit: 10,
+          allowFullRetry: true,
+          skipObviousMismatch: true
+        })
+      });
+      const data = (await response.json()) as BatchReviewResponse;
+      if (!response.ok) {
+        setResults((current) => {
+          const next = { ...current };
+          for (const creator of targets) next[creator.id] = { error: data.error || "主页样本与 AI 画像失败" };
+          return next;
+        });
+        return;
+      }
+
+      const rows = data.results || [];
+      const rowMap = new Map(rows.filter((row) => row.id).map((row) => [row.id as number, row]));
+      setResults((current) => {
+        const next = { ...current };
+        for (const row of rows) if (row.id) next[row.id] = row;
+        return next;
+      });
+      setCreators((current) => current
+        .map((creator) => {
+          const row = rowMap.get(creator.id);
+          if (!row) return creator;
+          return {
+            ...creator,
+            poolStatus: row.poolStatus || creator.poolStatus,
+            screeningStatus: row.screeningStatus || creator.screeningStatus,
+            screeningSummary: row.screeningSummary || row.message || creator.screeningSummary,
+            avgLikes: row.avgLikes ?? creator.avgLikes,
+            maxLikes: row.maxLikes ?? creator.maxLikes,
+            recentWorkCount: row.recentWorkCount ?? creator.recentWorkCount,
+            viralWorkCount: row.viralWorkCount ?? creator.viralWorkCount,
+            sampleWorkCount: row.sampleWorkCount ?? creator.sampleWorkCount
+          };
+        })
+        .filter((creator) => !["rejected", "skipped"].includes(creator.poolStatus)));
+    } finally {
+      setIsBatchRunning(false);
+    }
+  }
+
   const isBusy = runningId !== null || isBatchRunning;
-  const priorityCount = creators.filter(isPriorityCreator).length;
+  const portraitQueue = creators.filter((creator) => creator.poolStatus === "pending_review");
+  const metricQueue = creators.filter((creator) => creator.poolStatus === "candidate" && creator.screeningStatus === "portrait_passed");
+  const priorityCount = metricQueue.filter(isPriorityCreator).length;
   const batchCount = buildBatchQueue(creators, onlyPriorityBatch).length;
-  const batchModeText = onlyPriorityBatch && priorityCount === 0 && creators.length ? "暂无强候选，将按综合优先级跑普通候选" : "优先复筛高赞、强候选和疑似活跃达人";
+  const batchModeText = onlyPriorityBatch && priorityCount === 0 && creators.length ? "暂无强候选，将按数据表现排序" : "只读取已记录的主页指标，不重新采集";
 
   return (
-    <div className="discover-stack">
-      <section className="panel review-note">
-        <h2>待复筛池</h2>
-        <p>这里的达人已经通过内容初筛。批量复筛默认只跑强候选，并用更少主页作品先快速判断；单个达人仍可手动复筛。</p>
+    <div className="discover-stack review-layout">
+      <section className="panel review-note workflow-guide">
+        <span className="review-guide-icon">i</span>
+        <div>
+          <h2>分层筛选说明</h2>
+          <p>样本与画像队列负责补齐主页作品并调用品类 AI；画像通过后进入待选库。数据门槛阶段只读快照，不再启动 Crawler 或调用 AI。</p>
+        </div>
       </section>
 
-      <section className="panel campaign-task-picker">
+      <section className="panel campaign-task-picker workflow-section workflow-primary-section">
         <div>
+          <span className="workflow-kicker">01 · 当前品类</span>
           <h2>品类任务</h2>
-          <p>复筛会按当前任务判断，并把结果写回这个任务下的达人状态。</p>
+          <p>数据门槛结果会写回当前品类任务；作品画像仍由该品类的 AI 模板负责。</p>
         </div>
         <div className="campaign-task-picker-controls">
-          <select onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
-            <option value="">全局待复筛池</option>
+          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="review-brand-library" />
+          <select hidden onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+            <option value="">全局样本与数据队列</option>
             {campaignTasks.map((task) => (
               <option key={task.id} value={task.id}>
                 {task.name}
@@ -274,58 +365,93 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
         ) : null}
       </section>
 
-      <section className="panel">
+      <section className="panel workflow-section workflow-action-section">
         <div className="panel-header">
           <div>
+            <span className="workflow-kicker">02 · 精选门槛</span>
             <h2>精选库规则</h2>
             <p>当前规则：{selectedRuleLabels}</p>
           </div>
-          <button disabled={!batchCount || isBusy} onClick={reviewAll} type="button">
-            {isBatchRunning ? "批量复筛中..." : `批量复筛前${batchCount}个`}
-          </button>
+          <div className="task-actions">
+            <button disabled={!portraitQueue.length || isBusy} onClick={() => void profileCreators(portraitQueue.slice(0, 30))} type="button">
+              {isBatchRunning ? "处理中..." : `补齐样本并画像前${Math.min(30, portraitQueue.length)}个`}
+            </button>
+            <button disabled={!batchCount || isBusy} onClick={reviewAll} type="button">
+              {isBatchRunning ? "处理中..." : `对前${batchCount}个应用数据门槛`}
+            </button>
+          </div>
         </div>
 
-        <div className="review-speed-row">
-          <label className={onlyPriorityBatch ? "selected" : ""}>
-            <input checked={onlyPriorityBatch} onChange={() => setOnlyPriorityBatch((value) => !value)} type="checkbox" />
-            <span>批量只跑强候选/AI保留</span>
-          </label>
-          <label>
-            <span>批量抓取作品数</span>
-            <select onChange={(event) => setBatchWorkLimit(Number(event.target.value))} value={batchWorkLimit}>
-              <option value={3}>3条：最快，先粗筛</option>
-              <option value={6}>6条：平衡</option>
-              <option value={10}>10条：更完整</option>
-            </select>
-          </label>
-        </div>
+        <div className="review-rule-console">
+          <div className="review-rule-toolbar">
+            <div>
+              <strong>数据门槛</strong>
+              <span className="review-switch active" aria-hidden="true"><i /></span>
+              <span>已开启</span>
+            </div>
+            <span>指标已经在 AI 画像阶段记录，本阶段不再抓取作品。</span>
+          </div>
 
-        <div className="topic-list">
-          <label className={rules.requireAvgLikes500 ? "selected" : ""}>
+          <div className="topic-list review-metric-grid">
+          <label className={`review-metric-card ${rules.requireAvgLikes500 ? "selected" : ""}`}>
             <input checked={Boolean(rules.requireAvgLikes500)} onChange={() => toggleRule("requireAvgLikes500")} type="checkbox" />
-            <span>平均点赞 &gt; 500</span>
+            <span>平均点赞</span>
+            <input min={0} onChange={(event) => setNumberRule("avgLikesThreshold", Number(event.target.value))} type="number" value={rules.avgLikesThreshold || 500} />
           </label>
-          <label className={rules.requireViral2000 ? "selected" : ""}>
+          <label className={`review-metric-card wide ${rules.requireViral2000 ? "selected" : ""}`}>
             <input checked={Boolean(rules.requireViral2000)} onChange={() => toggleRule("requireViral2000")} type="checkbox" />
-            <span>出现点赞 &gt; 2000 爆款</span>
+            <span>爆款作品</span>
+            <input min={1} onChange={(event) => setNumberRule("minViralWorks", Number(event.target.value))} type="number" value={rules.minViralWorks || 1} />
+            <em>条，点赞 ≥</em>
+            <input min={0} onChange={(event) => setNumberRule("viralLikesThreshold", Number(event.target.value))} type="number" value={rules.viralLikesThreshold || 2000} />
           </label>
-          <label className={rules.requireWorkCount10 ? "selected" : ""}>
+          <label className={`review-metric-card ${rules.requireWorkCount10 ? "selected" : ""}`}>
             <input checked={Boolean(rules.requireWorkCount10)} onChange={() => toggleRule("requireWorkCount10")} type="checkbox" />
-            <span>作品总数 &gt; 10</span>
+            <span>主页样本数</span>
+            <input min={1} onChange={(event) => setNumberRule("minSampleWorks", Number(event.target.value))} type="number" value={rules.minSampleWorks || 10} />
           </label>
-          <label className={rules.requireRecentViral ? "selected" : ""}>
+          <label className={`review-metric-card compact ${rules.requireRecentViral ? "selected" : ""}`}>
             <input checked={Boolean(rules.requireRecentViral)} onChange={() => toggleRule("requireRecentViral")} type="checkbox" />
             <span>爆款作品在近 1 个月内</span>
           </label>
+          <label className={`review-metric-card compact ${rules.requireRecentUpdate ? "selected" : ""}`}>
+            <input checked={Boolean(rules.requireRecentUpdate)} onChange={() => toggleRule("requireRecentUpdate")} type="checkbox" />
+            <span>近 1 个月有更新</span>
+          </label>
+          </div>
+
+          <div className="review-rule-options">
+            <label className={onlyPriorityBatch ? "selected" : ""}>
+              <input checked={onlyPriorityBatch} onChange={() => setOnlyPriorityBatch((value) => !value)} type="checkbox" />
+              <span>只处理高优先级待选</span>
+            </label>
+            <label>
+              <span>多项门槛逻辑</span>
+              <select
+                onChange={(event) => setRules((current) => ({ ...current, metricMatchMode: event.target.value === "any" ? "any" : "all" }))}
+                value={rules.metricMatchMode || "all"}
+              >
+                <option value="all">需要全部满足</option>
+                <option value="any">满足任意一项</option>
+              </select>
+            </label>
+            <div>
+              <span>本次应用范围</span>
+              <strong>前 {batchCount} 个待选达人</strong>
+            </div>
+          </div>
+
+          <p className="review-rule-tip">数据门槛只校验画像阶段记录的指标；建议先完成主页样本和 AI 画像，再批量应用门槛。</p>
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel workflow-section workflow-results-section">
         <div className="panel-header">
           <div>
-            <h2>待复筛达人</h2>
+            <span className="workflow-kicker">03 · 待处理达人</span>
+            <h2>样本与数据筛选队列</h2>
             <p>
-              当前 {creators.length} 个。批量队列 {batchCount} 个，强候选 {priorityCount} 个；{batchModeText}。
+              待补齐/画像 {portraitQueue.length} 个，画像通过待选 {metricQueue.length} 个，数据门槛队列 {batchCount} 个；{batchModeText}。
             </p>
           </div>
         </div>
@@ -357,8 +483,8 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
                       <strong>{creator.viralWorkCount}</strong>
                     </div>
                     <div>
-                      <span>状态</span>
-                      <strong>{statusLabel(result?.screeningStatus)}</strong>
+                      <span>主页样本</span>
+                      <strong>{creator.sampleWorkCount}</strong>
                     </div>
                   </div>
 
@@ -374,20 +500,26 @@ export function ReviewClient({ initialCreators, initialCampaignTasks, initialCam
                     )}
                   </div>
 
-                  <button disabled={isBusy} onClick={() => reviewCreator(creator)} type="button">
-                    {runningId === creator.id ? "复筛中..." : "轻量复筛这个达人"}
-                  </button>
+                  {creator.poolStatus === "pending_review" ? (
+                    <button disabled={isBusy} onClick={() => void profileCreators([creator])} type="button">
+                      补齐主页样本并 AI 画像
+                    </button>
+                  ) : (
+                    <button disabled={isBusy} onClick={() => reviewCreator(creator)} type="button">
+                      {runningId === creator.id ? "筛选中..." : "应用数据门槛"}
+                    </button>
+                  )}
                 </article>
               );
             })}
           </div>
         ) : (
-          <p className="empty-state">待复筛池现在是空的。先去达人发现页把内容初筛通过的人加入待复筛池。</p>
+          <p className="empty-state">目前没有完成 AI 画像并通过的待选达人。请先在 Agent 工作台完成主页样本补齐和作品画像初筛。</p>
         )}
 
         {Object.entries(results).length ? (
           <div className="result-box discover-result">
-            <strong>最近复筛结果</strong>
+            <strong>最近筛选结果</strong>
             {Object.entries(results)
               .slice(-5)
               .map(([id, result]) => (

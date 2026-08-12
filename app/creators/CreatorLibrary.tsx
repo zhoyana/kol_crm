@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
+import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 import type { Creator } from "@/lib/creators";
 
 type CreatorLibraryProps = {
   creators: Creator[];
+  initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
   initialCampaignTaskId: number | null;
 };
@@ -28,7 +30,7 @@ const priorityLabel: Record<string, string> = {
 };
 
 const poolLabel: Record<string, string> = {
-  pending_review: "待复筛池",
+  pending_review: "样本/画像队列",
   candidate: "达人待选库",
   featured: "达人精选库",
   skipped: "已跳过"
@@ -38,7 +40,7 @@ const poolTabs = [
   { value: ALL, label: "全部" },
   { value: "candidate", label: "达人待选库" },
   { value: "featured", label: "达人精选库" },
-  { value: "pending_review", label: "待复筛池" },
+  { value: "pending_review", label: "样本/画像队列" },
   { value: "skipped", label: "已跳过" }
 ];
 
@@ -67,7 +69,7 @@ function todayText(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaignTaskId }: CreatorLibraryProps) {
+export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId }: CreatorLibraryProps) {
   const [items, setItems] = useState(creators);
   const [campaignTasks] = useState(initialCampaignTasks);
   const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
@@ -352,13 +354,15 @@ export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaign
 
   return (
     <>
-      <section className="panel campaign-task-picker">
+      <section className="panel campaign-task-picker workflow-section workflow-primary-section">
         <div>
+          <span className="workflow-kicker">01 · 当前视图</span>
           <h2>品类任务视图</h2>
           <p>选择任务后，库类型会优先显示这个任务下的状态；不选任务则查看全局达人库。</p>
         </div>
         <div className="campaign-task-picker-controls">
-          <select onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
+          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="creators-brand-library" />
+          <select hidden onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
             <option value="">全局达人库</option>
             {campaignTasks.map((task) => (
               <option key={task.id} value={task.id}>
@@ -389,11 +393,12 @@ export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaign
         ) : null}
       </section>
 
-      <section className="panel">
+      <section className="panel workflow-section workflow-action-section">
         <div className="panel-header">
           <div>
+            <span className="workflow-kicker">02 · 库类型</span>
             <h2>库类型</h2>
-            <p>用待选库、精选库、待复筛池和已跳过区分不同阶段。明显不符合目标的达人可以直接删除。</p>
+            <p>用样本/画像队列、待选库、精选库和已跳过区分不同阶段。明显不符合目标的达人可以直接删除。</p>
           </div>
           <div className="action-row">
             <button className="secondary-button" disabled={isBatchReviewing} onClick={sendFilteredCandidatesToReview} type="button">
@@ -419,7 +424,7 @@ export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaign
         </div>
       </section>
 
-      <section className="filter-bar">
+      <section className="filter-bar workflow-filter-bar">
         <label>
           搜索
           <input onChange={(event) => setKeyword(event.target.value)} placeholder="达人昵称、类目、备注" value={keyword} />
@@ -461,9 +466,10 @@ export function CreatorLibrary({ creators, initialCampaignTasks, initialCampaign
 
       {error ? <p className="form-error">{error}</p> : null}
 
-      <section className="panel">
+      <section className="panel workflow-section workflow-results-section">
         <div className="panel-header">
           <div>
+            <span className="workflow-kicker">03 · 达人明细</span>
             <h2>达人列表</h2>
             <p>
               当前显示 {filteredCreators.length} / {items.length} 个达人。

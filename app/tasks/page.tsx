@@ -1,9 +1,11 @@
 import Link from "next/link";
-import { getCampaignTasks } from "@/lib/campaign-tasks";
+import { getBrandLibraries, getCampaignTasks } from "@/lib/campaign-tasks";
 import { formatNumber, generateOutreachScript, getCreators, getOutreachTasks } from "@/lib/creators";
 import { TaskActions } from "./TaskActions";
 import { TaskCampaignPicker } from "./TaskCampaignPicker";
 import { BatchOutreachPanel } from "./BatchOutreachPanel";
+import { InboxMonitorPanel } from "./InboxMonitorPanel";
+import { getOutreachInbox } from "@/lib/outreach-inbox";
 
 export const dynamic = "force-dynamic";
 
@@ -22,7 +24,7 @@ const priorityLabel = {
 export default async function TasksPage({ searchParams }: { searchParams?: Promise<{ campaignTaskId?: string }> }) {
   const params = await searchParams;
   const campaignTaskId = Number(params?.campaignTaskId || 0) || null;
-  const [campaignTasks, creators] = await Promise.all([getCampaignTasks(), getCreators(campaignTaskId)]);
+  const [campaignTasks, creators, brandLibraries, conversations] = await Promise.all([getCampaignTasks(), getCreators(campaignTaskId), getBrandLibraries(), getOutreachInbox(campaignTaskId)]);
   const selectedCampaignTask = campaignTasks.find((task) => task.id === campaignTaskId) || null;
   const tasks = getOutreachTasks(creators);
   const initialTasks = tasks.filter((task) => task.kind === "initial");
@@ -38,29 +40,7 @@ export default async function TasksPage({ searchParams }: { searchParams?: Promi
   }));
 
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">K</div>
-          <div>
-            <strong>KOL CRM</strong>
-            <span>达人筛选工作台</span>
-          </div>
-        </div>
-        <nav>
-          <Link href="/agent">筛选 Agent</Link>
-          <Link href="/discover">达人发现</Link>
-          <Link href="/">仪表盘</Link>
-          <Link href="/review">达人复筛</Link>
-          <Link href="/creators">达人库</Link>
-          <a className="active">建联任务</a>
-          <Link href="/import">导入 CSV</Link>
-          <a>投放项目</a>
-          <a>预算复盘</a>
-        </nav>
-      </aside>
-
-      <section className="content">
+    <section className="content workflow-page tasks-workflow">
         <header className="topbar">
           <div>
             <h1>建联任务</h1>
@@ -71,10 +51,11 @@ export default async function TasksPage({ searchParams }: { searchParams?: Promi
           </Link>
         </header>
 
-        <TaskCampaignPicker campaignTasks={campaignTasks} selectedCampaignTask={selectedCampaignTask} />
+        <TaskCampaignPicker brandLibraries={brandLibraries} campaignTasks={campaignTasks} selectedCampaignTask={selectedCampaignTask} />
         <BatchOutreachPanel campaignTaskId={campaignTaskId} candidates={batchCandidates} />
+        <InboxMonitorPanel conversations={conversations.map((item: any) => ({ id: item.id, status: item.status, lastPreview: item.lastPreview, lastInboundAt: item.lastInboundAt?.toISOString() || null, unreadCount: item.unreadCount, creator: item.creator }))} />
 
-        <section className="metrics">
+        <section className="metrics workflow-metrics">
           <div>
             <span>任务总数</span>
             <strong>{tasks.length}</strong>
@@ -97,7 +78,7 @@ export default async function TasksPage({ searchParams }: { searchParams?: Promi
           </div>
         </section>
 
-        <section className="task-board">
+        <section className="task-board workflow-task-board">
           <TaskColumn
             campaignTaskId={campaignTaskId}
             description="还没有联系过，适合先发送品类任务下的个性化合作意向。"
@@ -113,7 +94,6 @@ export default async function TasksPage({ searchParams }: { searchParams?: Promi
           <TaskColumn campaignTaskId={campaignTaskId} description="已经联系过，但合作状态还没有落定。" tasks={followupTasks} title="二次跟进" />
         </section>
       </section>
-    </main>
   );
 }
 
@@ -154,6 +134,9 @@ function TaskColumn({
                   </div>
                   <span className={`priority ${task.creator.priority}`}>{priorityLabel[task.creator.priority]}</span>
                 </div>
+                <p className="outreach-status-mark">
+                  建联状态：<strong>{task.creator.outreachStatus}</strong>
+                </p>
 
                 <dl className="task-meta">
                   <div>

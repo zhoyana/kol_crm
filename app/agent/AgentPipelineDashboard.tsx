@@ -3,10 +3,13 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import { normalizeAgentGoal, type AgentGoal } from "@/lib/agent-goals";
+import { resolveDiscoveryRuleTemplate } from "@/lib/discovery-rule-templates";
 
-type WorkStage = "crawling" | "discovering" | "screening" | "importing" | "reviewing" | "outreach_ready";
-type Stage = "idle" | WorkStage | "completed" | "failed";
-type StepStatus = "waiting" | "running" | "paused" | "success" | "failed";
+type WorkStage = "crawling" | "discovering" | "importing" | "profiling" | "reviewing" | "outreach_ready";
+type Stage = "idle" | WorkStage | "completed" | "stopped" | "failed";
+type StartStage = "crawling" | "discovering" | "profiling" | "reviewing";
+type StepStatus = "waiting" | "running" | "paused" | "success" | "stopped" | "skipped" | "failed";
 
 type StepMetric = {
   startedAt?: string;
@@ -28,18 +31,96 @@ type PipelineState = {
   updatedAt: string;
   metrics: Partial<Record<WorkStage, StepMetric>>;
   logs: string[];
+  goal: AgentGoal;
+  usage: {
+    collectedWorks: number;
+    aiCalls: number;
+    currentRound: number;
+    noGrowthRounds: number;
+    featuredAtStart: number;
+    featuredAdded: number;
+    startedAt?: string;
+    stopReason?: string;
+  };
+};
+
+type PersistedRun = {
+  id: number;
+  version: number;
+  status: string;
+  startStage?: StartStage;
+  rounds?: AgentRound[];
+  state: Partial<PipelineState>;
+};
+
+type AgentRound = {
+  id: number;
+  roundNumber: number;
+  keyword: string;
+  status: string;
+  collectedWorks: number;
+  candidatesFound: number;
+  importedCount: number;
+  aiCalls: number;
+  portraitPassed: number;
+  featuredAdded: number;
+  featuredTotal: number;
+  decision?: string;
+  stopReason?: string;
+  error?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  strategy?: {
+    status: string;
+    model?: string;
+    action?: string;
+    confidence?: number;
+    reason?: string;
+    expectedBenefit?: string;
+    risk?: string;
+    executionScope?: { keyword?: string | null; max_creators?: number | null; max_ai_calls?: number | null };
+    stopCondition?: string;
+    humanMessage?: string;
+    error?: string;
+  };
+  feedbacks?: AgentStrategyFeedback[];
+};
+
+type AgentStrategyFeedback = {
+  id: number;
+  verdict: string;
+  originalAction?: string;
+  finalAction?: string;
+  note?: string;
+  executionRequested: boolean;
+  executionStatus: string;
+  executionMessage?: string;
+  createdAt?: string;
+};
+
+const strategyActionLabels: Record<string, string> = {
+  continue_next_keyword: "继续下一个关键词",
+  retry_current_keyword: "重试当前关键词",
+  supplement_incomplete: "补采信息不足达人",
+  optimize_keywords: "优化采集关键词",
+  review_rules: "人工检查筛选规则",
+  request_human_review: "请求人工复核",
+  stop_target_reached: "达到目标，建议停止",
+  stop_budget_reached: "达到预算，建议停止",
+  stop_low_yield: "产出过低，建议停止"
 };
 
 const steps: Array<{ id: WorkStage; title: string; description: string }> = [
-  { id: "crawling", title: "启动并等待采集", description: "按任务关键词采集抖音作品" },
-  { id: "discovering", title: "聚合候选达人", description: "从作品数据合并达人账号" },
-  { id: "screening", title: "AI 候选初筛", description: "按品类规则淘汰明显不匹配账号" },
-  { id: "importing", title: "自动加入复筛", description: "将保留账号写入待复筛池" },
-  { id: "reviewing", title: "分批主页复筛", description: "每批最多 30 人检查主页与近期作品" },
+  { id: "crawling", title: "关键词作品采集", description: "按任务关键词采集抖音作品" },
+  { id: "discovering", title: "聚合与硬排除", description: "聚合达人并排除机构号、大V等明显不符合账号" },
+  { id: "importing", title: "建立画像队列", description: "将候选写入主页样本补齐队列" },
+  { id: "profiling", title: "主页样本与 AI 画像", description: "统一补齐主页样本，记录指标并按人群模板判断画像" },
+  { id: "reviewing", title: "数据门槛筛选", description: "只读取已记录指标，决定进入精选或留在待选" },
   { id: "outreach_ready", title: "生成建联队列", description: "整理通过复筛的达人供建联使用" }
 ];
 
-const initialState: PipelineState = {
+function createInitialState(goal: AgentGoal, featuredAtStart = 0): PipelineState {
+  return {
   stage: "idle",
   message: "等待启动完整流程",
   completed: 0,
@@ -48,18 +129,22 @@ const initialState: PipelineState = {
   error: "",
   updatedAt: "",
   metrics: {},
-  logs: []
-};
+    logs: [],
+    goal,
+    usage: { collectedWorks: 0, aiCalls: 0, currentRound: 1, noGrowthRounds: 0, featuredAtStart, featuredAdded: 0 }
+  };
+}
 
 const stageLabels: Record<Stage, string> = {
   idle: "等待启动",
   crawling: "采集中",
   discovering: "正在聚合达人",
-  screening: "AI 初筛中",
-  importing: "正在加入复筛",
-  reviewing: "主页复筛中",
+  importing: "正在建立画像队列",
+  profiling: "主页补采与 AI 画像中",
+  reviewing: "数据门槛筛选中",
   outreach_ready: "正在生成建联队列",
   completed: "全部完成",
+  stopped: "已按条件停止",
   failed: "执行失败"
 };
 
@@ -84,26 +169,87 @@ function durationText(startedAt?: string, finishedAt?: string, now = Date.now())
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
-function normalizeSavedState(saved: Partial<PipelineState>): PipelineState {
+function normalizeSavedState(saved: Partial<PipelineState>, fallbackGoal: AgentGoal): PipelineState {
+  const initialState = createInitialState(fallbackGoal);
   return {
     ...initialState,
     ...saved,
     importedIds: Array.isArray(saved.importedIds) ? saved.importedIds : [],
     metrics: saved.metrics || {},
-    logs: Array.isArray(saved.logs) ? saved.logs.slice(-80) : []
+    logs: Array.isArray(saved.logs) ? saved.logs.slice(-80) : [],
+    goal: normalizeAgentGoal(saved.goal, fallbackGoal),
+    usage: { ...initialState.usage, ...(saved.usage || {}) }
   };
 }
 
-export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
+class AgentStopError extends Error {
+  constructor(public reason: string, message: string) { super(message); }
+}
+
+export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdated }: {
+  task: CampaignTaskItem;
+  featuredAtStart?: number;
+  onTaskUpdated?: (task: CampaignTaskItem) => void;
+}) {
+  const initialState = createInitialState(task.agentGoalDefaults, featuredAtStart);
+  const metricTemplate = resolveDiscoveryRuleTemplate(task).metricRules;
   const storageKey = `kol-crm-agent-pipeline:${task.id}`;
   const pauseRef = useRef(false);
   const stageRef = useRef<Stage>("idle");
   const candidatesRef = useRef<any[]>([]);
   const stateRef = useRef<PipelineState>(initialState);
+  const runIdRef = useRef<number | null>(null);
+  const runVersionRef = useRef(0);
+  const persistTimerRef = useRef<number | null>(null);
+  const persistQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pollTimerRef = useRef<number | null>(null);
+  const persistenceConflictRef = useRef(false);
   const [state, setStateValue] = useState<PipelineState>(initialState);
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  const [persistenceError, setPersistenceError] = useState("");
   const [now, setNow] = useState(Date.now());
+  const [startStage, setStartStage] = useState<StartStage>("crawling");
+  const [runStartStage, setRunStartStage] = useState<StartStage | null>(null);
+  const [queueCounts, setQueueCounts] = useState({ profiling: 0, reviewing: 0 });
+  const [goalDraft, setGoalDraft] = useState<AgentGoal>(task.agentGoalDefaults);
+  const goalDefaultsKey = JSON.stringify(task.agentGoalDefaults);
+  const [goalSaving, setGoalSaving] = useState(false);
+  const [goalMessage, setGoalMessage] = useState("");
+  const [rounds, setRounds] = useState<AgentRound[]>([]);
+  const [strategyDrafts, setStrategyDrafts] = useState<Record<number, { action: string; note: string }>>({});
+  const [strategySavingId, setStrategySavingId] = useState<number | null>(null);
+
+  function strategyDraft(round: AgentRound) {
+    return strategyDrafts[round.id] || { action: round.strategy?.action || "request_human_review", note: "" };
+  }
+
+  function updateStrategyDraft(round: AgentRound, patch: Partial<{ action: string; note: string }>) {
+    setStrategyDrafts((current) => ({ ...current, [round.id]: { ...strategyDraft(round), ...patch } }));
+  }
+
+  async function submitStrategyFeedback(round: AgentRound, verdict: "accepted" | "rejected" | "modified", execute = false) {
+    const draft = strategyDraft(round);
+    setStrategySavingId(round.id);
+    try {
+      const response = await fetch("/api/agent/strategy-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ roundId: round.id, verdict, finalAction: draft.action, note: draft.note, execute })
+      });
+      const data = await response.json().catch(() => ({})) as { feedback?: AgentStrategyFeedback; error?: string };
+      if (!response.ok || !data.feedback) throw new Error(data.error || "保存策略反馈失败");
+      setRounds((items) => items.map((item) => item.id === round.id
+        ? { ...item, feedbacks: [...(item.feedbacks || []), data.feedback as AgentStrategyFeedback] }
+        : item));
+      if (execute) setStrategyDrafts((current) => ({ ...current, [round.id]: { ...draft, note: "" } }));
+    } catch (error) {
+      setPersistenceError(error instanceof Error ? error.message : "保存策略反馈失败");
+    } finally {
+      setStrategySavingId(null);
+    }
+  }
 
   function setState(next: PipelineState | ((current: PipelineState) => PipelineState)) {
     setStateValue((current) => {
@@ -113,37 +259,123 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     });
   }
 
-  useEffect(() => {
-    try {
-      const raw = JSON.parse(window.localStorage.getItem(storageKey) || "null") as Partial<PipelineState> | null;
-      if (!raw) return;
-      const saved = normalizeSavedState(raw);
-      if (steps.some((step) => step.id === saved.stage)) {
-        const interruptedStage = saved.stage as WorkStage;
-        stageRef.current = "failed";
-        setState({
-          ...saved,
-          stage: "failed",
-          failedStage: interruptedStage,
-          error: "上次执行被页面刷新或服务重启中断，可以从失败步骤重试。",
-          message: "流程已中断，等待重试。",
-          metrics: {
-            ...saved.metrics,
-            [interruptedStage]: { ...saved.metrics[interruptedStage], detail: "执行中断" }
-          }
-        });
-      } else {
-        stageRef.current = saved.stage;
-        setState(saved);
+  async function createRun(snapshot: PipelineState, enqueue = false): Promise<PersistedRun> {
+    const response = await fetch("/api/agent/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ campaignTaskId: task.id, state: snapshot, enqueue, startStage })
+    });
+    const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun; error?: string };
+    if (!response.ok || !data.run) throw new Error(data.error || "创建 Agent 运行记录失败");
+    runIdRef.current = data.run.id;
+    runVersionRef.current = data.run.version;
+    return data.run;
+  }
+
+  async function persistSnapshot(snapshot: PipelineState): Promise<void> {
+    const runId = runIdRef.current;
+    if (!runId) return;
+    const response = await fetch("/api/agent/runs", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runId, version: runVersionRef.current, state: snapshot })
+    });
+    const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun; error?: string };
+    if (!response.ok || !data.run) {
+      if (response.status === 409 && data.run) {
+        persistenceConflictRef.current = true;
       }
-    } catch {
-      setState(initialState);
+      throw new Error(data.error || "Agent 运行状态保存失败");
     }
-  }, [storageKey]);
+    runVersionRef.current = data.run.version;
+    setPersistenceError("");
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    async function hydrate() {
+      setHydrated(false);
+      setPersistenceError("");
+      persistenceConflictRef.current = false;
+      try {
+        const response = await fetch(`/api/agent/runs?campaignTaskId=${task.id}`, { cache: "no-store" });
+        const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun | null; error?: string };
+        if (!response.ok) throw new Error(data.error || "读取 Agent 运行状态失败");
+
+        const run = data.run || null;
+        let saved: PipelineState;
+        if (run) {
+          runIdRef.current = run.id;
+          runVersionRef.current = run.version;
+          setRunStartStage(run.startStage || "crawling");
+          setRounds(run.rounds || []);
+          saved = normalizeSavedState(run.state, task.agentGoalDefaults);
+          setRunning(["queued", "running", "paused", "stopping"].includes(run.status));
+          setPaused(run.status === "paused");
+        } else {
+          const local = JSON.parse(window.localStorage.getItem(storageKey) || "null") as Partial<PipelineState> | null;
+          saved = normalizeSavedState(local || initialState, task.agentGoalDefaults);
+        }
+        if (cancelled) return;
+        stageRef.current = saved.stage;
+        stateRef.current = saved;
+        setStateValue(saved);
+      } catch (error) {
+        if (cancelled) return;
+        setPersistenceError(error instanceof Error ? error.message : "读取 Agent 运行状态失败");
+        stageRef.current = "idle";
+        stateRef.current = initialState;
+        setStateValue(initialState);
+      } finally {
+        if (!cancelled) setHydrated(true);
+      }
+    }
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [storageKey, task.id]);
 
   useEffect(() => {
     window.localStorage.setItem(storageKey, JSON.stringify(state));
   }, [state, storageKey]);
+
+  useEffect(() => {
+    if (!hydrated || !running) return;
+    let cancelled = false;
+    let lastSignature = "";
+    async function pollRun() {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      try {
+        const response = await fetch(`/api/agent/runs?campaignTaskId=${task.id}`, { cache: "no-store" });
+        const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun | null; error?: string };
+        if (!response.ok) throw new Error(data.error || "读取 Agent 运行状态失败");
+        if (!data.run || cancelled) return;
+        const run = data.run;
+        const signature = `${run.status}|${run.version}|${(run.rounds || []).length}|${run.startStage || ""}`;
+        if (signature === lastSignature) return;
+        lastSignature = signature;
+        runIdRef.current = run.id;
+        runVersionRef.current = run.version;
+        setRunStartStage(run.startStage || "crawling");
+        setRounds(run.rounds || []);
+        const saved = normalizeSavedState(run.state, task.agentGoalDefaults);
+        stageRef.current = saved.stage;
+        stateRef.current = saved;
+        setStateValue(saved);
+        setRunning(["queued", "running", "paused", "stopping"].includes(run.status));
+        setPaused(run.status === "paused");
+        setPersistenceError("");
+      } catch (error) {
+        if (!cancelled) setPersistenceError(error instanceof Error ? error.message : "读取 Agent 运行状态失败");
+      }
+    }
+    if (pollTimerRef.current) window.clearInterval(pollTimerRef.current);
+    const timer = window.setInterval(() => void pollRun(), 2000);
+    pollTimerRef.current = timer;
+    void pollRun();
+    return () => { cancelled = true; window.clearInterval(timer); pollTimerRef.current = null; };
+  }, [hydrated, running, goalDefaultsKey, task.id]);
 
   useEffect(() => {
     if (!running) return;
@@ -151,9 +383,65 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     return () => window.clearInterval(timer);
   }, [running]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadCounts() {
+      const stages: Array<"profiling" | "reviewing"> = ["profiling", "reviewing"];
+      const results = await Promise.all(stages.map(async (stage) => {
+        const response = await fetch(`/api/creators/review?campaignTaskId=${task.id}&stage=${stage}`);
+        const data = await response.json().catch(() => ({}));
+        return [stage, response.ok ? Number(data.total || 0) : 0] as const;
+      }));
+      if (!cancelled) setQueueCounts(Object.fromEntries(results) as { profiling: number; reviewing: number });
+    }
+    void loadCounts();
+    return () => {
+      cancelled = true;
+    };
+  }, [task.id, state.updatedAt]);
+
   function update(patch: Partial<PipelineState>) {
     if (patch.stage) stageRef.current = patch.stage;
     setState((current) => ({ ...current, ...patch, updatedAt: new Date().toISOString() }));
+  }
+
+  function updateUsage(patch: Partial<PipelineState["usage"]>) {
+    setState((current) => ({
+      ...current,
+      usage: { ...current.usage, ...patch },
+      updatedAt: new Date().toISOString()
+    }));
+  }
+
+  function ensureWithinTime() {
+    const { startedAt } = stateRef.current.usage;
+    if (!startedAt) return;
+    const elapsed = Date.now() - new Date(startedAt).getTime();
+    if (elapsed >= stateRef.current.goal.maxDurationMinutes * 60_000) {
+      throw new AgentStopError("time_limit_reached", "已达到最长运行时间，Agent 已安全停止。 ");
+    }
+  }
+
+  async function saveGoalDefaults() {
+    setGoalSaving(true);
+    setGoalMessage("");
+    try {
+      const goal = normalizeAgentGoal(goalDraft, task.agentGoalDefaults);
+      const response = await fetch("/api/campaign-tasks", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: task.id, agentGoalDefaults: goal })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.task) throw new Error(data.error || "保存默认目标失败");
+      setGoalDraft(data.task.agentGoalDefaults);
+      onTaskUpdated?.(data.task);
+      setGoalMessage("已保存为这个任务的默认目标。");
+    } catch (error) {
+      setGoalMessage(error instanceof Error ? error.message : "保存默认目标失败");
+    } finally {
+      setGoalSaving(false);
+    }
   }
 
   function updateStep(stage: WorkStage, patch: Partial<StepMetric>) {
@@ -216,7 +504,13 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     return data;
   }
 
+  async function loadQueueIds(stage: "profiling" | "reviewing"): Promise<string[]> {
+    const data = await requestJson(`/api/creators/review?campaignTaskId=${task.id}&stage=${stage}`);
+    return Array.isArray(data.ids) ? data.ids.map(String).filter(Boolean) : [];
+  }
+
   async function crawl() {
+    ensureWithinTime();
     enterStep("crawling", "正在启动关键词采集…", 1);
     const keyword = task.seedKeywords.join(",");
     await requestJson("/api/crawler/douyin/start", {
@@ -225,7 +519,7 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
       body: JSON.stringify({
         keyword,
         campaignTaskId: task.id,
-        maxNotes: 100,
+        maxNotes: Math.min(300, stateRef.current.goal.maxCollectedWorks),
         discoveryMode: "single",
         topicLimit: 3,
         publishWindowDays: 180,
@@ -257,6 +551,7 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
             results: [{ label: "已采集作品", value: collectedWorks, tone: "success" }]
           }
         },
+        usage: { ...current.usage, collectedWorks },
         updatedAt: new Date().toISOString()
       }));
       if (crawler.status === "succeeded") break;
@@ -271,7 +566,8 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     });
   }
 
-  async function discoverAndScreen() {
+  async function discoverCandidates() {
+    ensureWithinTime();
     await waitWhilePaused();
     enterStep("discovering", "正在从采集结果聚合候选达人…", 1);
     const keyword = task.seedKeywords.join(",");
@@ -292,53 +588,17 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
       })
     });
     candidatesRef.current = Array.isArray(discovered.candidates) ? discovered.candidates : [];
-    if (!candidatesRef.current.length) throw new Error("达人聚合完成，但没有可进入 AI 初筛的新候选。");
+    if (!candidatesRef.current.length) throw new Error("达人聚合完成，但没有可进入作品画像阶段的新候选。");
     finishStep("discovering", `聚合出 ${candidatesRef.current.length} 位候选达人`, candidatesRef.current.length, candidatesRef.current.length);
     updateStep("discovering", {
       results: [{ label: "聚合达人", value: candidatesRef.current.length, tone: "success" }]
     });
-
-    enterStep("screening", `正在 AI 初筛 ${candidatesRef.current.length} 位候选…`, candidatesRef.current.length);
-    const beforeCount = candidatesRef.current.length;
-    const screened = await requestJson("/api/ai/candidate-screen", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keyword, campaignTaskId: task.id, candidates: candidatesRef.current })
-    });
-    const decisionMap = new Map((screened.decisions || []).map((item: any) => [String(item.id), item]));
-    const decisions = Array.isArray(screened.decisions) ? screened.decisions : [];
-    const keepCount = decisions.filter((item: any) => item.decision === "keep").length;
-    const maybeCount = decisions.filter((item: any) => item.decision === "maybe").length;
-    const dropCount = decisions.filter((item: any) => item.decision === "drop").length;
-    candidatesRef.current = candidatesRef.current
-      .filter((candidate) => (decisionMap.get(candidate.externalId) as any)?.decision !== "drop")
-      .map((candidate) => {
-        const decision: any = decisionMap.get(candidate.externalId);
-        if (!decision) return candidate;
-        return {
-          ...candidate,
-          screeningStatus: decision.decision === "keep" ? "candidate_strong" : "candidate_observe",
-          screeningSummary: `${candidate.screeningSummary || ""}；AI ${decision.decision}：${decision.reason || "未说明"}`
-        };
-      });
-    finishStep(
-      "screening",
-      `AI 初筛完成：保留 ${candidatesRef.current.length} 人，淘汰 ${beforeCount - candidatesRef.current.length} 人`,
-      beforeCount,
-      beforeCount
-    );
-    updateStep("screening", {
-      results: [
-        { label: "强保留", value: keepCount, tone: "success" },
-        { label: "待观察", value: maybeCount, tone: "warning" },
-        { label: "淘汰", value: dropCount, tone: "danger" }
-      ]
-    });
   }
 
   async function importCandidates() {
+    ensureWithinTime();
     await waitWhilePaused();
-    enterStep("importing", "正在加入待复筛池…", candidatesRef.current.length);
+    enterStep("importing", "正在建立主页样本与画像队列…", candidatesRef.current.length);
     if (!candidatesRef.current.length) throw new Error("没有可导入候选，请从达人聚合步骤重试。");
     const imported = await requestJson("/api/discover/douyin/import", {
       method: "POST",
@@ -347,7 +607,7 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     });
     const importedIds = candidatesRef.current.map((candidate) => String(candidate.externalId)).filter(Boolean);
     update({ importedIds });
-    finishStep("importing", `已加入复筛池 ${importedIds.length} 人`, importedIds.length, importedIds.length);
+    finishStep("importing", `已建立画像队列 ${importedIds.length} 人`, importedIds.length, importedIds.length);
     updateStep("importing", {
       results: [
         { label: "新加入", value: Number(imported.imported || 0), tone: "success" },
@@ -357,9 +617,121 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     });
   }
 
+  async function profileCandidates(ids: string[]) {
+    if (!ids.length) throw new Error("没有需要补齐主页样本的达人 ID。");
+    enterStep("profiling", "正在补齐主页样本并执行 AI 作品画像初筛…", ids.length);
+    let completed = 0;
+    let portraitPassed = 0;
+    let insufficient = 0;
+    let crawlIncomplete = 0;
+    let rejected = 0;
+    let failed = 0;
+    let totalSamples = 0;
+    const batchSize = 30;
+
+    for (let index = 0; index < ids.length; index += batchSize) {
+      await waitWhilePaused();
+      ensureWithinTime();
+      const remainingAiCalls = stateRef.current.goal.maxAiCalls - stateRef.current.usage.aiCalls;
+      if (remainingAiCalls <= 0) throw new AgentStopError("ai_budget_reached", "已达到 AI 调用上限，Agent 已安全停止。 ");
+      const batch = ids.slice(index, index + Math.min(batchSize, remainingAiCalls));
+      const batchNumber = Math.floor(index / batchSize) + 1;
+      const batchTotal = Math.ceil(ids.length / batchSize);
+      update({ completed, message: `正在补齐第 ${batchNumber}/${batchTotal} 批主页样本，本批 ${batch.length} 人` });
+      const batchStartedAt = Date.now();
+      const heartbeat = window.setInterval(() => {
+        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - batchStartedAt) / 1000));
+        const elapsedText = elapsedSeconds < 60
+          ? `${elapsedSeconds} 秒`
+          : `${Math.floor(elapsedSeconds / 60)} 分 ${elapsedSeconds % 60} 秒`;
+        update({
+          completed,
+          message: `第 ${batchNumber}/${batchTotal} 批仍在运行：MediaCrawler 正在采集 ${batch.length} 位达人主页，已等待 ${elapsedText}`
+        });
+        updateStep("profiling", {
+          completed,
+          total: ids.length,
+          detail: `本批正在采集/等待抖音响应，已运行 ${elapsedText}`
+        });
+      }, 10_000);
+      let profiled: any;
+      try {
+        updateUsage({ aiCalls: stateRef.current.usage.aiCalls + batch.length });
+        profiled = await requestJson("/api/review/douyin/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "portrait",
+            ids: batch,
+            campaignTaskId: task.id,
+            workLimit: 10,
+            allowFullRetry: true,
+            skipObviousMismatch: true
+          })
+        });
+      } finally {
+        window.clearInterval(heartbeat);
+      }
+      const rows = Array.isArray(profiled.results) ? profiled.results : [];
+      portraitPassed += rows.filter((item: any) => item.poolStatus === "candidate" && item.screeningStatus === "portrait_passed").length;
+      insufficient += rows.filter((item: any) => item.screeningStatus === "portrait_insufficient").length;
+      crawlIncomplete += rows.filter((item: any) =>
+        String(item.screeningStatus).includes("incomplete") ||
+        (item.poolStatus === "pending_review" && item.screeningStatus !== "portrait_insufficient")
+      ).length;
+      rejected += rows.filter((item: any) => ["rejected", "skipped"].includes(String(item.poolStatus))).length;
+      failed += rows.filter((item: any) => item.error).length;
+      totalSamples += rows.reduce((sum: number, item: any) => sum + Number(item.sampleWorkCount || 0), 0);
+      completed += batch.length;
+      update({ completed, message: `作品画像进度：${completed}/${ids.length}` });
+      updateStep("profiling", {
+        completed,
+        total: ids.length,
+        detail: `已处理 ${completed}/${ids.length} 人`,
+        results: [
+          { label: "主页作品样本", value: totalSamples, tone: "neutral" },
+          { label: "画像通过", value: portraitPassed, tone: "success" },
+          { label: "AI 信息不足", value: insufficient, tone: "warning" },
+          { label: "采集不完整", value: crawlIncomplete, tone: "danger" },
+          { label: "画像排除", value: rejected, tone: "danger" },
+          { label: "失败", value: failed, tone: "warning" }
+        ]
+      });
+      if (batch.length < Math.min(batchSize, ids.length - index)) {
+        throw new AgentStopError("ai_budget_reached", "已达到 AI 调用上限，Agent 已安全停止。 ");
+      }
+    }
+
+    finishStep("profiling", `主页样本与 AI 画像完成，共处理 ${ids.length} 人`, ids.length, ids.length);
+    updateStep("profiling", {
+      results: [
+        { label: "主页作品样本", value: totalSamples, tone: "neutral" },
+        { label: "进入待选", value: portraitPassed, tone: "success" },
+        { label: "AI 信息不足", value: insufficient, tone: "warning" },
+        { label: "采集不完整", value: crawlIncomplete, tone: "danger" },
+        { label: "画像排除", value: rejected, tone: "danger" }
+      ]
+    });
+  }
+
   async function reviewCandidates(ids: string[]) {
-    if (!ids.length) throw new Error("没有待复筛达人 ID，请重新执行达人发现。");
-    enterStep("reviewing", "正在分批进行主页复筛…", ids.length);
+    enterStep("reviewing", "正在读取已记录指标并应用数据门槛…", ids.length);
+    if (!ids.length) {
+      finishStep("reviewing", "当前没有画像通过的待选达人，数据门槛无需执行", 0, 0);
+      updateStep("reviewing", {
+        results: [
+          { label: "进入精选", value: 0, tone: "success" },
+          { label: "留待选", value: 0, tone: "neutral" }
+        ]
+      });
+      enterStep("outreach_ready", "正在生成建联队列…", 1);
+      finishStep("outreach_ready", "建联队列已生成，当前新增 0 人", 1, 1);
+      updateStep("outreach_ready", {
+        results: [{ label: "待建联达人", value: 0, tone: "success" }]
+      });
+      update({ stage: "completed", message: "全链路完成；当前没有新增精选达人。" });
+      return;
+    }
     let completed = 0;
     let reviewSucceeded = 0;
     let reviewFailed = 0;
@@ -369,14 +741,15 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     const reviewBatchSize = 30;
     for (let index = 0; index < ids.length; index += reviewBatchSize) {
       await waitWhilePaused();
+      ensureWithinTime();
       const batch = ids.slice(index, index + reviewBatchSize);
       const batchNumber = Math.floor(index / reviewBatchSize) + 1;
       const batchTotal = Math.ceil(ids.length / reviewBatchSize);
-      update({ completed, message: `正在处理第 ${batchNumber}/${batchTotal} 批，本批 ${batch.length} 人` });
+      update({ completed, message: `正在处理第 ${batchNumber}/${batchTotal} 批数据门槛，本批 ${batch.length} 人` });
       updateStep("reviewing", {
         completed,
         total: ids.length,
-        detail: `第 ${batchNumber}/${batchTotal} 批正在复筛`
+        detail: `第 ${batchNumber}/${batchTotal} 批正在读取指标`
       });
       const reviewed = await requestJson("/api/review/douyin/batch", {
         method: "POST",
@@ -384,9 +757,19 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
         body: JSON.stringify({
           ids: batch,
           campaignTaskId: task.id,
-          workLimit: 6,
-          allowFullRetry: true,
-          skipObviousMismatch: true
+          mode: "metrics",
+          rules: {
+            requireAvgLikes500: metricTemplate.requireAvgLikes,
+            avgLikesThreshold: metricTemplate.avgLikesThreshold,
+            requireViral2000: metricTemplate.requireViralWorks,
+            viralLikesThreshold: metricTemplate.viralLikesThreshold,
+            minViralWorks: metricTemplate.minViralWorks,
+            requireWorkCount10: metricTemplate.requireSampleWorks,
+            minSampleWorks: metricTemplate.minSampleWorks,
+            metricMatchMode: metricTemplate.matchMode,
+            requireRecentViral: false,
+            requireRecentUpdate: metricTemplate.requireRecentUpdate
+          }
         })
       });
       const batchResults = Array.isArray(reviewed.results) ? reviewed.results : [];
@@ -400,27 +783,28 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
         item.ok && !["featured", "skipped", "rejected"].includes(String(item.poolStatus))
       ).length;
       completed += batch.length;
-      update({ completed, message: `主页复筛进度：${completed}/${ids.length}` });
+      updateUsage({ featuredAdded: featured });
+      update({ completed, message: `数据门槛进度：${completed}/${ids.length}` });
       updateStep("reviewing", {
         completed,
         total: ids.length,
         detail: `已完成 ${completed}/${ids.length} 人`,
         results: [
-          { label: "复筛成功", value: reviewSucceeded, tone: "success" },
+          { label: "规则已执行", value: reviewSucceeded, tone: "success" },
           { label: "进入精选", value: featured, tone: "success" },
           { label: "留待选", value: pending, tone: "neutral" },
-          { label: "直接排除", value: rejected, tone: "danger" },
+          { label: "画像未通过", value: rejected, tone: "danger" },
           { label: "失败", value: reviewFailed, tone: "warning" }
         ]
       });
     }
-    finishStep("reviewing", `主页复筛完成，共处理 ${ids.length} 人`, ids.length, ids.length);
+    finishStep("reviewing", `数据门槛筛选完成，共处理 ${ids.length} 人`, ids.length, ids.length);
     updateStep("reviewing", {
       results: [
-        { label: "复筛成功", value: reviewSucceeded, tone: "success" },
+        { label: "规则已执行", value: reviewSucceeded, tone: "success" },
         { label: "进入精选", value: featured, tone: "success" },
         { label: "留待选", value: pending, tone: "neutral" },
-        { label: "直接排除", value: rejected, tone: "danger" },
+        { label: "画像未通过", value: rejected, tone: "danger" },
         { label: "失败", value: reviewFailed, tone: "warning" }
       ]
     });
@@ -431,26 +815,79 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     updateStep("outreach_ready", {
       results: [{ label: "待建联达人", value: featured, tone: "success" }]
     });
-    update({ stage: "completed", message: "全链路完成，精选达人已进入建联队列。" });
+    if (featured >= stateRef.current.goal.targetFeaturedCount) {
+      throw new AgentStopError("target_reached", `本轮已新增 ${featured} 位精选达人并生成建联队列，达到目标。`);
+    }
+    update({
+      stage: "completed",
+      message: `单轮流程完成，本轮新增 ${featured} 位精选达人。`,
+      usage: {
+        ...stateRef.current.usage,
+        featuredAdded: featured,
+        noGrowthRounds: featured === 0 ? 1 : 0,
+        stopReason: "single_round_completed"
+      }
+    });
   }
 
-  async function execute(fromStage: Stage = "crawling") {
+  async function execute(fromStage: Stage = "crawling", freshRun = false) {
     setRunning(true);
     setPaused(false);
     pauseRef.current = false;
-    if (fromStage === "crawling") setState({ ...initialState, updatedAt: new Date().toISOString() });
+    if (freshRun || fromStage === "crawling") {
+      const startedAt = new Date().toISOString();
+      const nextState = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart);
+      nextState.updatedAt = startedAt;
+      nextState.usage.startedAt = startedAt;
+      stageRef.current = "idle";
+      candidatesRef.current = [];
+      stateRef.current = nextState;
+      runIdRef.current = null;
+      runVersionRef.current = 0;
+      persistenceConflictRef.current = false;
+      setState(nextState);
+      try {
+        await createRun(nextState);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "创建 Agent 运行记录失败";
+        setPersistenceError(message);
+        setRunning(false);
+        return;
+      }
+    }
     try {
       if (fromStage === "crawling") await crawl();
-      if (["crawling", "discovering", "screening", "importing"].includes(fromStage)) {
-        await discoverAndScreen();
+      if (["crawling", "discovering", "importing"].includes(fromStage)) {
+        await discoverCandidates();
         await importCandidates();
       }
       const savedIds = stateRef.current.importedIds;
-      const ids = savedIds.length && fromStage === "reviewing"
-        ? savedIds
-        : candidatesRef.current.map((candidate) => String(candidate.externalId)).filter(Boolean);
-      await reviewCandidates(ids);
+      let profileIds = candidatesRef.current.map((candidate) => String(candidate.externalId)).filter(Boolean);
+      if (!profileIds.length) profileIds = savedIds;
+      if (fromStage === "profiling") profileIds = await loadQueueIds("profiling");
+
+      if (fromStage !== "reviewing" && fromStage !== "outreach_ready") {
+        if (!profileIds.length) throw new Error("当前任务没有等待补齐主页样本或 AI 画像的达人。");
+        await profileCandidates(profileIds);
+      }
+
+      const metricIds = await loadQueueIds("reviewing");
+      await reviewCandidates(metricIds);
     } catch (error) {
+      if (error instanceof AgentStopError) {
+        const stoppedAt = new Date().toISOString();
+        stageRef.current = "stopped";
+        setState((current) => ({
+          ...current,
+          stage: "stopped",
+          message: error.message.trim(),
+          error: "",
+          updatedAt: stoppedAt,
+          usage: { ...current.usage, stopReason: error.reason },
+          logs: [...current.logs, `[${timeText(stoppedAt)}] 停止：${error.message.trim()}`].slice(-80)
+        }));
+        return;
+      }
       const currentStage = (stageRef.current === "failed" ? fromStage : stageRef.current) as WorkStage;
       const errorMessage = error instanceof Error ? error.message : "Agent 执行失败";
       const failedAt = new Date().toISOString();
@@ -475,60 +912,86 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
     }
   }
 
-  function pause() {
-    pauseRef.current = true;
-    setPaused(true);
-    update({ message: "已请求暂停；当前网络请求或当前复筛批次完成后暂停。" });
-  }
-
-  function resume() {
-    pauseRef.current = false;
-    setPaused(false);
-    update({ message: "继续执行队列。" });
-  }
-
-  function retry() {
-    let failedStage: Stage = state.failedStage || "crawling";
-    if (["discovering", "screening", "importing"].includes(failedStage) && !candidatesRef.current.length) {
-      failedStage = "discovering";
+  async function startRemoteRun() {
+    setPersistenceError("");
+    const startedAt = new Date().toISOString();
+    const snapshot = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart);
+    snapshot.updatedAt = startedAt;
+    snapshot.usage.startedAt = startedAt;
+    try {
+      const run = await createRun(snapshot, true);
+      setRunStartStage(run.startStage || startStage);
+      setRounds(run.rounds || []);
+      setState(normalizeSavedState(run.state, task.agentGoalDefaults));
+      setRunning(true);
+      setPaused(false);
+    } catch (error) {
+      setPersistenceError(error instanceof Error ? error.message : "后台任务创建失败");
     }
-    void execute(failedStage);
   }
 
-  function reset() {
-    if (running) return;
-    stageRef.current = "idle";
-    candidatesRef.current = [];
-    setState(initialState);
+  async function controlRun(action: "pause" | "resume" | "cancel" | "retry") {
+    const runId = runIdRef.current;
+    if (!runId) return;
+    try {
+      const response = await fetch("/api/agent/runs", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId, action })
+      });
+      const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun; error?: string };
+      if (!response.ok || !data.run) throw new Error(data.error || "更新后台任务失败");
+      const saved = normalizeSavedState(data.run.state, task.agentGoalDefaults);
+      setRounds(data.run.rounds || []);
+      setState(saved);
+      setRunning(["queued", "running", "paused", "stopping"].includes(data.run.status));
+      setPaused(data.run.status === "paused");
+    } catch (error) {
+      setPersistenceError(error instanceof Error ? error.message : "更新后台任务失败");
+    }
   }
 
-  const activeStage = state.stage === "failed" ? state.failedStage : state.stage;
-  const activeIndex = steps.findIndex((step) => step.id === activeStage);
-  const completedSteps = state.stage === "completed"
-    ? steps.length
-    : steps.filter((step) => Boolean(state.metrics[step.id]?.finishedAt)
-      && !(state.stage === "failed" && state.failedStage === step.id)).length;
-  const overallProgress = Math.round((completedSteps / steps.length) * 100);
+  const pause = () => void controlRun("pause");
+  const resume = () => void controlRun("resume");
+  const retry = () => void controlRun("retry");
+
+  const stoppedStage = state.stage === "stopped"
+    ? steps.find((step) => state.metrics[step.id]?.startedAt && !state.metrics[step.id]?.finishedAt)?.id
+    : undefined;
+  const selectedStartIndex = runStartStage ? Math.max(0, steps.findIndex((step) => step.id === runStartStage)) : 0;
+  const applicableSteps = steps.slice(selectedStartIndex);
+  const completedSteps = applicableSteps.filter((step) => Boolean(state.metrics[step.id]?.finishedAt)
+    && !(state.stage === "failed" && state.failedStage === step.id)).length;
   const stepProgress = state.total ? Math.min(100, Math.round((state.completed / state.total) * 100)) : 0;
+  const partialStage = state.stage === "stopped" ? stoppedStage : steps.some((step) => step.id === state.stage)
+    ? state.stage as WorkStage
+    : undefined;
+  const partialProgress = partialStage
+    && applicableSteps.some((step) => step.id === partialStage)
+    && !state.metrics[partialStage]?.finishedAt
+    ? stepProgress / 100
+    : 0;
+  const overallProgress = Math.round(((completedSteps + partialProgress) / applicableSteps.length) * 100);
 
   const stepStatuses = useMemo(() => {
     return Object.fromEntries(steps.map((step, index) => {
       let status: StepStatus = "waiting";
+      if (runStartStage && index < selectedStartIndex) status = "skipped";
       if (state.metrics[step.id]?.finishedAt) status = "success";
       if (state.stage === step.id) status = paused ? "paused" : "running";
       if (state.stage === "failed" && state.failedStage === step.id) status = "failed";
-      if (state.stage === "completed") status = "success";
-      if (status === "waiting" && activeIndex >= 0 && index < activeIndex) status = "success";
+      if (state.stage === "stopped" && stoppedStage === step.id) status = "stopped";
       return [step.id, status];
     })) as Record<WorkStage, StepStatus>;
-  }, [activeIndex, paused, state.failedStage, state.metrics, state.stage]);
+  }, [paused, runStartStage, selectedStartIndex, state.failedStage, state.metrics, state.stage, stoppedStage]);
 
   return (
     <section className="panel agent-pipeline-panel">
       <div className="panel-header">
         <div>
+          <span className="agent-section-kicker">02 · 一键执行</span>
           <h2>一键执行 Agent</h2>
-          <p>完整展示采集、AI 初筛、导入、主页复筛和建联队列的执行位置。</p>
+          <p>选择起点后启动，Agent 会按顺序完成筛选并持续显示进度。</p>
         </div>
         <span className={`agent-pipeline-badge ${state.stage}`}>{stageLabels[state.stage]}</span>
       </div>
@@ -536,11 +999,72 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
       <div className="agent-overall">
         <div className="agent-overall-heading">
           <strong>整条流程</strong>
-          <span>{completedSteps}/{steps.length} 步 · {overallProgress}%</span>
+          <span>{completedSteps}/{applicableSteps.length} 个本次步骤 · {overallProgress}%</span>
         </div>
         <div className="agent-pipeline-progress" aria-label={`整条流程完成 ${overallProgress}%`}>
           <div style={{ width: `${overallProgress}%` }} />
         </div>
+      </div>
+
+      <details className="agent-goal-editor" open={state.stage === "idle"}>
+        <summary>
+          <span><strong>本轮目标与停止条件</strong><small>未修改时使用当前任务的默认值</small></span>
+          <b>编辑目标</b>
+        </summary>
+        <div className="agent-goal-grid">
+          {([
+            ["targetFeaturedCount", "新增精选目标", "人"],
+            ["maxCollectedWorks", "单个关键词采集", "条/词"],
+            ["maxAiCalls", "最多 AI 画像", "人次"],
+            ["maxDurationMinutes", "最长运行", "分钟"],
+            ["maxNoGrowthRounds", "无新增停止", "轮"],
+            ["maxRounds", "最多运行", "轮"]
+          ] as Array<[keyof AgentGoal, string, string]>).map(([key, label, unit]) => (
+            <label key={key}>
+              <span>{label}</span>
+              <div><input disabled={running} min="1" type="number" value={goalDraft[key]} onChange={(event) => setGoalDraft((goal) => ({ ...goal, [key]: Number(event.target.value) }))} /><em>{unit}</em></div>
+            </label>
+          ))}
+        </div>
+        <div className="task-actions agent-goal-actions">
+          <button className="secondary-button" disabled={running} onClick={() => setGoalDraft(task.agentGoalDefaults)} type="button">恢复任务默认值</button>
+          <button className="secondary-button" disabled={running || goalSaving} onClick={() => void saveGoalDefaults()} type="button">{goalSaving ? "保存中…" : "保存为任务默认值"}</button>
+          <span>{goalMessage || "直接修改只影响下一次运行；保存后才会成为该任务默认值。"}</span>
+        </div>
+        <p className="agent-goal-note">每轮使用一个采集关键词；未达到目标时自动切换下一个关键词，直到命中任一停止条件。</p>
+      </details>
+
+      <div className="agent-budget-grid">
+        <div><span>本次进入精选</span><strong>{state.usage.featuredAdded}/{state.goal.targetFeaturedCount}</strong></div>
+        <div><span>采集作品总数</span><strong>{state.usage.collectedWorks}</strong><small>{task.seedKeywords.length} 个关键词 · 每词最多 {state.goal.maxCollectedWorks} 条</small></div>
+        <div><span>实际 AI 调用</span><strong>{state.usage.aiCalls}/{state.goal.maxAiCalls}</strong></div>
+        <div><span>运行时长</span><strong>{state.usage.startedAt ? durationText(state.usage.startedAt, state.stage === "completed" || state.stage === "stopped" || state.stage === "failed" ? state.updatedAt : undefined, now) : "0 秒"} / {state.goal.maxDurationMinutes} 分</strong></div>
+        <div><span>运行轮次</span><strong>{state.usage.currentRound}/{state.goal.maxRounds}</strong></div>
+      </div>
+
+      <div className="task-actions agent-primary-actions">
+        <label className="agent-start-stage">
+          <span>从哪一步开始</span>
+          <select disabled={running} onChange={(event) => setStartStage(event.target.value as StartStage)} value={startStage}>
+            <option value="crawling">1. 从关键词作品采集开始（完整流程）</option>
+            <option value="discovering">2. 从已有采集结果聚合开始</option>
+            <option value="profiling">3. 从样本与 AI 画像开始（{queueCounts.profiling} 人）</option>
+            <option value="reviewing">4. 从待选库数据门槛开始（{queueCounts.reviewing} 人）</option>
+          </select>
+        </label>
+        <button disabled={running || !hydrated || Boolean(persistenceError)} onClick={() => void startRemoteRun()} type="button">
+          {!hydrated ? "正在恢复运行状态…" : running ? "后台 Agent 执行中…" : startStage === "crawling" ? "启动后台完整流程" : "从所选步骤后台启动"}
+        </button>
+        {running && !paused ? <button className="secondary-button" onClick={pause} type="button">暂停</button> : null}
+        {running && paused ? <button className="secondary-button" onClick={resume} type="button">继续</button> : null}
+        {running ? <button className="secondary-button" onClick={() => void controlRun("cancel")} type="button">取消运行</button> : null}
+        {state.stage === "failed" ? <button className="secondary-button" disabled={running} onClick={retry} type="button">从失败步骤重试</button> : null}
+        {state.stage === "stopped" && ["ai_budget_reached", "time_limit_reached"].includes(state.usage.stopReason || "") ? (
+          <button className="secondary-button" disabled={running} onClick={retry} type="button">从停止步骤重新运行</button>
+        ) : null}
+      {state.stage === "completed" || state.stage === "stopped" ? (
+          <Link className="button-link" href={`/tasks?campaignTaskId=${task.id}`}>查看建联队列</Link>
+        ) : null}
       </div>
 
       <div className="agent-step-grid">
@@ -551,10 +1075,10 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
             <article className={`agent-step-card ${status}`} key={step.id}>
               <div className="agent-step-top">
                 <span className="agent-step-number">
-                  {status === "success" ? "✓" : status === "failed" ? "!" : index + 1}
+                  {status === "success" ? "✓" : status === "failed" ? "!" : status === "stopped" ? "■" : status === "skipped" ? "—" : index + 1}
                 </span>
                 <span className={`agent-step-status ${status}`}>
-                  {status === "waiting" ? "等待" : status === "running" ? "进行中" : status === "paused" ? "已暂停" : status === "success" ? "完成" : "失败"}
+                  {status === "waiting" ? "等待" : status === "running" ? "进行中" : status === "paused" ? "已暂停" : status === "success" ? "完成" : status === "stopped" ? "已停止" : status === "skipped" ? "本次跳过" : "失败"}
                 </span>
               </div>
               <strong>{step.title}</strong>
@@ -592,6 +1116,7 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
       ) : null}
 
       {state.error ? <p className="form-error">{state.error}</p> : null}
+      {persistenceError ? <p className="form-error">运行状态数据库异常：{persistenceError}</p> : null}
 
       {state.logs.length ? (
         <details className="agent-log-panel" open={running || state.stage === "failed"}>
@@ -600,18 +1125,6 @@ export function AgentPipelineDashboard({ task }: { task: CampaignTaskItem }) {
         </details>
       ) : null}
 
-      <div className="task-actions">
-        <button disabled={running || state.stage === "completed"} onClick={() => void execute("crawling")} type="button">
-          {running ? "Agent 执行中…" : "启动完整流程"}
-        </button>
-        {running && !paused ? <button className="secondary-button" onClick={pause} type="button">暂停</button> : null}
-        {running && paused ? <button className="secondary-button" onClick={resume} type="button">继续</button> : null}
-        {state.stage === "failed" ? <button className="secondary-button" disabled={running} onClick={retry} type="button">从失败步骤重试</button> : null}
-        {!running && state.stage !== "idle" ? <button className="secondary-button" onClick={reset} type="button">清空本次进度</button> : null}
-        {state.stage === "completed" ? (
-          <Link className="button-link" href={`/tasks?campaignTaskId=${task.id}`}>查看建联队列</Link>
-        ) : null}
-      </div>
     </section>
   );
 }

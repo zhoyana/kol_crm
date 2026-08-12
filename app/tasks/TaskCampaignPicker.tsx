@@ -2,14 +2,16 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
+import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 
 type TaskCampaignPickerProps = {
+  brandLibraries: BrandLibraryItem[];
   campaignTasks: CampaignTaskItem[];
   selectedCampaignTask: CampaignTaskItem | null;
 };
 
-export function TaskCampaignPicker({ campaignTasks, selectedCampaignTask }: TaskCampaignPickerProps) {
+export function TaskCampaignPicker({ brandLibraries, campaignTasks, selectedCampaignTask }: TaskCampaignPickerProps) {
   const router = useRouter();
 
   function changeCampaignTask(taskId: string) {
@@ -17,13 +19,15 @@ export function TaskCampaignPicker({ campaignTasks, selectedCampaignTask }: Task
   }
 
   return (
-    <section className="panel campaign-task-picker">
+    <section className="panel campaign-task-picker workflow-section workflow-primary-section">
       <div>
+        <span className="workflow-kicker">01 · 当前品类</span>
         <h2>品类任务</h2>
         <p>选中任务后，建联清单只显示这个任务下的达人精选库。不同品类不会互相混在一起。</p>
       </div>
       <div className="campaign-task-picker-controls">
-        <select onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTask ? String(selectedCampaignTask.id) : ""}>
+        <BrandTaskPicker allowAll brandLibraries={brandLibraries} campaignTasks={campaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTask ? String(selectedCampaignTask.id) : ""} storageKey="tasks-brand-library" />
+        <select hidden onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTask ? String(selectedCampaignTask.id) : ""}>
           <option value="">全局精选库</option>
           {campaignTasks.map((task) => (
             <option key={task.id} value={task.id}>

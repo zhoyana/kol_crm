@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { csvRowsToObjects, numberValue } from "@/lib/csv";
+import { prisma } from "@/lib/prisma";
 
 type ImportCreatorInput = {
   externalId: string;
@@ -14,18 +15,6 @@ type ImportCreatorInput = {
   cooperationStatus: string | null;
   contact: string | null;
   notes: string | null;
-};
-
-type MiniPrismaClient = {
-  creator: {
-    findUnique: (args: { where: { externalId: string } }) => Promise<{ id: number } | null>;
-    upsert: (args: {
-      where: { externalId: string };
-      update: Omit<ImportCreatorInput, "externalId">;
-      create: ImportCreatorInput;
-    }) => Promise<{ id: number; name: string }>;
-  };
-  $disconnect: () => Promise<void>;
 };
 
 function textValue(record: Record<string, string>, keys: string[]): string {
@@ -66,12 +55,6 @@ function recordToCreator(record: Record<string, string>, index: number): ImportC
   };
 }
 
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
-}
-
 export async function POST(request: NextRequest) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "还没有配置 DATABASE_URL，请先把 MySQL 连接串放到 .env。" }, { status: 400 });
@@ -89,7 +72,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "CSV 里没有可导入的数据行。" }, { status: 400 });
   }
 
-  const prisma = await getPrisma();
+  // prisma singleton from import
   const errors: string[] = [];
   let imported = 0;
   let updated = 0;
@@ -115,7 +98,7 @@ export async function POST(request: NextRequest) {
       else imported += 1;
     }
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 
   return NextResponse.json({

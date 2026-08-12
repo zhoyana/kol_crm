@@ -1,20 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-
-type MiniPrismaClient = {
-  creatorFeedback: {
-    create: (args: any) => Promise<any>;
-  };
-  agentMemory: {
-    create: (args: any) => Promise<any>;
-  };
-  $disconnect: () => Promise<void>;
-};
-
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
-}
+import { prisma } from "@/lib/prisma";
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as any;
@@ -26,7 +11,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const prisma = await getPrisma();
+    // prisma singleton from import
 
     try {
       const feedback = await prisma.creatorFeedback.create({
@@ -53,7 +38,7 @@ export async function POST(request: NextRequest) {
 
       return NextResponse.json({ feedback, memory });
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "记录反馈失败。";

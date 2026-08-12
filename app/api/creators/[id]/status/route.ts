@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
 
 type RouteContext = {
   params: Promise<{
@@ -6,7 +7,8 @@ type RouteContext = {
   }>;
 };
 
-const allowedStatuses = new Set(["未建联", "待发送确认", "已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃"]);
+const allowedStatuses = new Set(["未建联", "待发送确认", "发送中", "已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃"]);
+const contactedStatuses = new Set(["发送中", "已建联", "需跟进", "已回复", "报价中", "确定合作"]);
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   if (!process.env.DATABASE_URL) {
@@ -28,8 +30,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   }
 
   try {
-    const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-    const prisma = new prismaModule.PrismaClient();
+    // prisma singleton from import
     const numericId = Number(id);
 
     try {
@@ -41,6 +42,24 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 
       if (!creator) {
         return NextResponse.json({ error: "没有找到达人。" }, { status: 404 });
+      }
+
+      if (body.action === "open_contact" && contactedStatuses.has(creator.outreachStatus)) {
+        return NextResponse.json(
+          { error: `该达人当前状态为“${creator.outreachStatus}”，已阻止重复打开初次建联流程。` },
+          { status: 409 }
+        );
+      }
+      if (body.outreachStatus === creator.outreachStatus) {
+        return NextResponse.json({
+          creator: {
+            id: creator.externalId || String(creator.id),
+            name: creator.name,
+            outreachStatus: creator.outreachStatus,
+            cooperationStatus: creator.cooperationStatus
+          },
+          unchanged: true
+        });
       }
 
       const updated = await prisma.creator.update({
@@ -70,7 +89,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
         }
       });
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch (error) {
     console.error(error);

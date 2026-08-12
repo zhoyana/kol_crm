@@ -6,10 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "worker": "node --env-file=.env --experimental-strip-types worker/agent-worker.mjs",
     "lint": "next lint",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
-    "db:seed": "node scripts/seed-mysql.mjs"
+    "db:seed": "node --env-file=.env scripts/seed-mysql.mjs",
+    "db:seed-brands": "node --env-file=.env scripts/seed-audience-templates.mjs",
+    "db:fix-brands": "node --env-file=.env scripts/fix-brand-consolidation.mjs"
   },
   "dependencies": {
     "@prisma/client": "^6.0.0",

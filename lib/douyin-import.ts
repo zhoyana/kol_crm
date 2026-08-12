@@ -1,6 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { csvRowsToObjects, numberValue } from "./csv";
+import { prisma as prismaSingleton } from "./prisma";
 
 const DISCOVERY_WINDOW_DAYS = 180;
 const ONE_MONTH_DAYS = 30;
@@ -777,7 +778,7 @@ export function rebuildDiscoveryCandidate(candidate: DouyinDiscoveryCandidate, w
 
 function mergeDiscoveryCandidates(
   candidates: DouyinDiscoveryCandidate[],
-  options: { requireRecentQualified?: boolean; keyword?: string } = {}
+  options: { requireRecentQualified?: boolean; keyword?: string; includeRejected?: boolean } = {}
 ): DouyinDiscoveryCandidate[] {
   const map = new Map<string, DouyinDiscoveryCandidate>();
 
@@ -812,7 +813,9 @@ function mergeDiscoveryCandidates(
     );
   }
 
-  const merged = Array.from(map.values()).filter((candidate) => candidate.poolStatus !== "rejected");
+  const merged = options.includeRejected
+    ? Array.from(map.values())
+    : Array.from(map.values()).filter((candidate) => candidate.poolStatus !== "rejected");
   const filtered = options.requireRecentQualified === false ? merged : merged.filter((candidate) => candidate.hasRecentQualifiedWork);
   return filtered.sort((a, b) => {
     const relevanceDiff = options.keyword ? candidateDiscoveryScore(b, options.keyword) - candidateDiscoveryScore(a, options.keyword) : 0;
@@ -820,7 +823,11 @@ function mergeDiscoveryCandidates(
   });
 }
 
-function parseJsonlDiscovery(input: string, category: string, options: { requireRecentQualified?: boolean } = {}): DouyinDiscoveryCandidate[] {
+function parseJsonlDiscovery(
+  input: string,
+  category: string,
+  options: { requireRecentQualified?: boolean; includeRejected?: boolean } = {}
+): DouyinDiscoveryCandidate[] {
   const rows = input
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -893,7 +900,7 @@ function parseCandidateCsv(record: Record<string, string>, category: string): Do
 export function parseDouyinDiscoveryCandidates(
   input: string,
   category = "未分类",
-  options: { requireRecentQualified?: boolean } = {}
+  options: { requireRecentQualified?: boolean; includeRejected?: boolean } = {}
 ): DouyinDiscoveryCandidate[] {
   const trimmed = input.trim();
   if (!trimmed) return [];
@@ -941,9 +948,7 @@ export function parseDouyinCandidates(input: string, category = "未分类"): Do
 }
 
 async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
+  return prismaSingleton as unknown as MiniPrismaClient;
 }
 
 function toDate(value: string | null): Date | null {
@@ -984,7 +989,7 @@ export async function importDouyinCandidates(candidates: DouyinCandidate[], sour
       else imported += 1;
     }
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 
   return { imported, updated, skipped: errors.length, total: candidates.length, errors, sourceFile };
@@ -1028,7 +1033,7 @@ export async function importDouyinWorksToPool(candidates: DouyinDiscoveryCandida
       }
     }
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 
   return { imported, updated, skipped: errors.length, total: imported + updated + errors.length, errors };
@@ -1208,7 +1213,7 @@ export async function searchDouyinCandidatesFromWorkPool(keyword: string): Promi
 
     return mergeDiscoveryCandidates(candidates, { keyword }).filter((candidate) => candidateMatchesDiscoveryIntent(candidate, keyword));
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }
 

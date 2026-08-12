@@ -161,7 +161,7 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
       const response = await fetch("/api/outreach/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profileUrl, message: draftScript })
+        body: JSON.stringify({ creatorId, profileUrl, message: draftScript, taskKind })
       });
       const result = (await response.json().catch(() => ({}))) as { ok?: boolean; message?: string; error?: string };
       if (!response.ok || !result.ok) {
@@ -169,12 +169,10 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
         return;
       }
 
-      const updated = await updateStatus(
-        "已建联",
-        "auto_send_douyin_message",
-        `已通过本地浏览器自动向 ${creatorName} 发送建联私信。\n\n话术：${draftScript}`
-      );
-      if (updated) setMessage("私信已发送，并已标记为已建联。");
+      setMessage("私信已发送，并已标记为已建联。");
+      startTransition(() => {
+        router.refresh();
+      });
     } catch {
       setMessage("自动建联接口没有响应；请确认9222浏览器已启动并已登录抖音。");
     } finally {

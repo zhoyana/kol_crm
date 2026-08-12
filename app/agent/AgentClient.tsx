@@ -1,12 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import type { CampaignTaskItem } from "@/lib/campaign-tasks";
+import { useEffect, useMemo, useState } from "react";
+import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
+import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 import type { CampaignTaskSummary } from "@/lib/agent-workbench";
 import { AgentPipelineDashboard } from "./AgentPipelineDashboard";
 
 type CampaignTaskDraft = {
+  brandLibraryId: string;
   name: string;
   productName: string;
   category: string;
@@ -18,19 +20,38 @@ type CampaignTaskDraft = {
   outreachTone: string;
 };
 
+type AudienceTemplateSummary = {
+  id: number;
+  brandLibraryId: number;
+  brandName: string | null;
+  name: string;
+  category: string | null;
+  targetAudience: string;
+  targetDescription: string;
+  discovery: { primaryTerms: string[]; supportTerms: string[]; excludeTerms: string[] };
+  acceptedIdentities: string[];
+  rejectedAccounts: string[];
+  metricRules: {
+    avgLikesThreshold: number;
+    viralLikesThreshold: number;
+    minViralWorks: number;
+    requireAvgLikes: boolean;
+    requireViralWorks: boolean;
+  };
+  examples: { positive: number; pending: number; negative: number };
+};
+
 const defaultCampaignTask: CampaignTaskDraft = {
-  name: "警校生-警察小熊",
-  productName: "警察小熊周边",
-  category: "警察周边",
-  targetAudience: "在校警校生、警校日常分享者",
-  targetDescription:
-    "寻找真实在校警校生个人账号，内容可以是校园生活、训练、通勤穿搭、宿舍日常、警校身份记录或轻生活分享。排除官方号、营销号、报考培训号、法考号、已从业警察科普号和纯颜值擦边账号。",
-  seedKeywords: "警校生，警校生活，警校生日常，藏蓝青春",
-  excludeKeywords: "官方号，蓝V，黄V，认证号，报考，招生，培训，法考，公务员考试，警察执法，警察新闻",
-  productSellingPoints:
-    "警察小熊，可爱但不幼稚，适合作为警校生活、通勤穿搭、宿舍桌面或包挂的小物件。",
-  outreachTone:
-    "自然、真诚、像正常私信，不要太商务，不要一上来强推报价，可以参考“宝子你好，我是蜀黍家PR，感觉你的风格和我们的产品很搭，想邀请你一起创作”。"
+  brandLibraryId: "",
+  name: "",
+  productName: "",
+  category: "",
+  targetAudience: "",
+  targetDescription: "",
+  seedKeywords: "",
+  excludeKeywords: "",
+  productSellingPoints: "",
+  outreachTone: ""
 };
 
 function splitTerms(value: string): string[] {
@@ -69,9 +90,11 @@ function createEmptySummary(campaignTaskId: number): CampaignTaskSummary {
 }
 
 export function AgentClient({
+  initialBrandLibraries,
   initialCampaignTasks,
   initialSummaries
 }: {
+  initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
   initialSummaries: CampaignTaskSummary[];
 }) {
@@ -80,9 +103,54 @@ export function AgentClient({
   const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(
     initialCampaignTasks[0]?.id ? String(initialCampaignTasks[0].id) : ""
   );
-  const [taskDraft, setTaskDraft] = useState(defaultCampaignTask);
+  const [taskDraft, setTaskDraft] = useState({ ...defaultCampaignTask, brandLibraryId: initialBrandLibraries[0]?.id ? String(initialBrandLibraries[0].id) : "" });
   const [taskSaving, setTaskSaving] = useState(false);
   const [message, setMessage] = useState("");
+
+  // 选品牌后自动加载对应的固定达人模板；命中后核心筛选规则锁定，仅允许补充少量关键词
+  const [audienceTemplate, setAudienceTemplate] = useState<AudienceTemplateSummary | null>(null);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [extraSeed, setExtraSeed] = useState("");
+  const [extraExclude, setExtraExclude] = useState("");
+
+  useEffect(() => {
+    const brandId = Number(taskDraft.brandLibraryId) || 0;
+    if (!brandId) {
+      setAudienceTemplate(null);
+      return;
+    }
+    let cancelled = false;
+    setTemplateLoading(true);
+    fetch(`/api/audience-templates?brandId=${brandId}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const templates: AudienceTemplateSummary[] = data?.templates || [];
+        const tmpl = templates[0] || null;
+        setAudienceTemplate(tmpl);
+        if (tmpl) {
+          // 核心筛选规则由模板决定，预填为只读展示
+          setTaskDraft((draft) => ({
+            ...draft,
+            targetAudience: tmpl.targetAudience || draft.targetAudience,
+            targetDescription: tmpl.targetDescription || draft.targetDescription,
+            seedKeywords: tmpl.discovery.primaryTerms.join("，"),
+            excludeKeywords: tmpl.discovery.excludeTerms.join("，")
+          }));
+          setExtraSeed("");
+          setExtraExclude("");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAudienceTemplate(null);
+      })
+      .finally(() => {
+        if (!cancelled) setTemplateLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [taskDraft.brandLibraryId]);
 
   const selectedTask = useMemo(
     () => campaignTasks.find((task) => String(task.id) === selectedCampaignTaskId) || null,
@@ -93,19 +161,6 @@ export function AgentClient({
     if (!selectedTask) return null;
     return summaries.find((item) => item.campaignTaskId === selectedTask.id) || createEmptySummary(selectedTask.id);
   }, [selectedTask, summaries]);
-
-  const totalCounts = useMemo(() => {
-    return summaries.reduce(
-      (acc, item) => {
-        acc.pendingReview += item.counts.pendingReview;
-        acc.candidate += item.counts.candidate;
-        acc.featured += item.counts.featured;
-        acc.featuredUncontacted += item.counts.featuredUncontacted;
-        return acc;
-      },
-      { pendingReview: 0, candidate: 0, featured: 0, featuredUncontacted: 0 }
-    );
-  }, [summaries]);
 
   function updateTaskDraft(field: keyof CampaignTaskDraft, value: string) {
     setTaskDraft((draft) => ({ ...draft, [field]: value }));
@@ -120,6 +175,7 @@ export function AgentClient({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          brandLibraryId: Number(taskDraft.brandLibraryId) || null,
           name: taskDraft.name,
           productName: taskDraft.productName,
           category: taskDraft.category,
@@ -128,7 +184,10 @@ export function AgentClient({
           seedKeywords: splitTerms(taskDraft.seedKeywords),
           excludeKeywords: splitTerms(taskDraft.excludeKeywords),
           productSellingPoints: splitTerms(taskDraft.productSellingPoints),
-          outreachTone: taskDraft.outreachTone
+          outreachTone: taskDraft.outreachTone,
+          audienceTemplateId: audienceTemplate ? audienceTemplate.id : null,
+          extraSeedKeywords: splitTerms(extraSeed),
+          extraExcludeKeywords: splitTerms(extraExclude)
         })
       });
       const data = await response.json();
@@ -151,64 +210,36 @@ export function AgentClient({
 
   return (
     <div className="agent-stack">
-      <section className="metrics">
-        <div>
-          <span>品类任务</span>
-          <strong>{campaignTasks.length}</strong>
-        </div>
-        <div>
-          <span>全部待复筛</span>
-          <strong>{totalCounts.pendingReview}</strong>
-        </div>
-        <div>
-          <span>全部精选</span>
-          <strong>{totalCounts.featured}</strong>
-        </div>
-        <div>
-          <span>精选未建联</span>
-          <strong>{totalCounts.featuredUncontacted}</strong>
-        </div>
-      </section>
-
-      <section className="panel agent-panel">
+      <section className="panel agent-panel agent-current-task-panel">
         <div className="panel-header">
           <div>
+            <span className="agent-section-kicker">01 · 当前任务</span>
             <h2>当前任务</h2>
-            <p>选择一个品类任务，Agent 会按这个任务判断你下一步该发现、复筛还是建联。</p>
+            <p>先确认本次要推进的任务，再执行完整筛选流程。</p>
           </div>
+          <label className="agent-task-select">
+            <span>切换任务</span>
+            <BrandTaskPicker brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={setSelectedCampaignTaskId} selectedTaskId={selectedCampaignTaskId} storageKey="agent-brand-library" />
+          </label>
         </div>
 
         <div className="agent-workbench-grid">
-          <label className="agent-task-select">
-            <span>品类任务</span>
-            <select
-              value={selectedCampaignTaskId}
-              onChange={(event) => setSelectedCampaignTaskId(event.target.value)}
-            >
-              {campaignTasks.length === 0 ? <option value="">还没有任务</option> : null}
-              {campaignTasks.map((task) => (
-                <option key={task.id} value={task.id}>
-                  {task.name}
-                </option>
-              ))}
-            </select>
-          </label>
-
           {selectedTask && selectedSummary ? (
             <>
+              <div className="agent-task-info">
+                <span className="agent-product-tag">{selectedTask.productName}</span>
+                <h3>{selectedTask.name}</h3>
+                <strong>{selectedTask.targetAudience}</strong>
+                <p>{selectedTask.targetDescription}</p>
+              </div>
+
               <div className="agent-suggestion">
-                <span>Agent 建议</span>
+                <span>Agent 下一步建议</span>
                 <strong>{selectedSummary.recommendation.title}</strong>
                 <p>{selectedSummary.recommendation.reason}</p>
                 <Link className="button-link" href={selectedSummary.recommendation.primaryHref}>
                   {selectedSummary.recommendation.primaryAction}
                 </Link>
-              </div>
-
-              <div className="agent-task-info">
-                <span>{selectedTask.productName}</span>
-                <strong>{selectedTask.targetAudience}</strong>
-                <p>{selectedTask.targetDescription}</p>
               </div>
             </>
           ) : (
@@ -220,7 +251,7 @@ export function AgentClient({
           <>
             <div className="agent-rule-meta">
               <div>
-                <span>待复筛</span>
+                <span>待补样本/画像</span>
                 <strong>{selectedSummary.counts.pendingReview}</strong>
               </div>
               <div>
@@ -247,7 +278,7 @@ export function AgentClient({
 
             <div className="workflow-actions">
               <Link href={selectedSummary.links.discover}>1. 达人发现</Link>
-              <Link href={selectedSummary.links.review}>2. 达人复筛</Link>
+              <Link href={selectedSummary.links.review}>2. 样本与数据筛选</Link>
               <Link href={selectedSummary.links.creators}>3. 达人库</Link>
               <Link href={selectedSummary.links.tasks}>4. 建联任务</Link>
             </div>
@@ -255,21 +286,86 @@ export function AgentClient({
         ) : null}
       </section>
 
-      <section className="panel agent-panel">
+      {selectedTask ? (
+        <AgentPipelineDashboard
+          key={selectedTask.id}
+          task={selectedTask}
+          featuredAtStart={selectedSummary?.counts.featured || 0}
+          onTaskUpdated={(updatedTask) => setCampaignTasks((items) => items.map((item) => item.id === updatedTask.id ? updatedTask : item))}
+        />
+      ) : null}
+
+      <section className="panel agent-panel agent-task-management-panel">
         <div className="panel-header">
           <div>
-            <h2>新增品类任务</h2>
-            <p>以后添加其他品类，就在这里新建任务。比如“警校生-通勤裤”“医生-护腰垫”，每个任务有自己的关键词、排除方向、产品卖点和建联语气。</p>
+            <span className="agent-section-kicker">03 · 任务管理</span>
+            <h2>任务管理</h2>
+            <p>新建任务，或点选已有任务设为当前推进目标。</p>
           </div>
-          <button onClick={saveCampaignTask} disabled={taskSaving} type="button">
-            {taskSaving ? "保存中..." : "保存任务"}
-          </button>
+          <span className="agent-task-count">{campaignTasks.length} 个任务</span>
         </div>
 
-        <div className="campaign-task-form">
+        <details className="agent-create-details">
+          <summary>
+            <span>
+              <strong>填写新任务配置</strong>
+              <small>任务目标、采集关键词、排除方向、产品卖点和建联语气</small>
+            </span>
+            <b>展开填写</b>
+          </summary>
+
+          <div className="campaign-task-form">
+          <label>
+            <span>所属品牌库</span>
+            <select value={taskDraft.brandLibraryId} onChange={(event) => updateTaskDraft("brandLibraryId", event.target.value)}>
+              {initialBrandLibraries.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+            </select>
+          </label>
+
+          {templateLoading ? (
+            <p className="template-loading">正在加载该品牌的人群模板…</p>
+          ) : audienceTemplate ? (
+            <div className="audience-template-card">
+              <div className="audience-template-head">
+                <span className="agent-section-kicker">已绑定固定达人模板</span>
+                <strong>{audienceTemplate.name}</strong>
+              </div>
+              <div className="audience-template-grid">
+                <div>
+                  <span>可接受身份</span>
+                  <p>{audienceTemplate.acceptedIdentities.join("、") || "—"}</p>
+                </div>
+                <div>
+                  <span>排除账号类型</span>
+                  <p>{audienceTemplate.rejectedAccounts.join("、") || "—"}</p>
+                </div>
+                <div>
+                  <span>核心采集词</span>
+                  <p>{audienceTemplate.discovery.primaryTerms.join("、")}</p>
+                </div>
+                <div>
+                  <span>排除词</span>
+                  <p>{audienceTemplate.discovery.excludeTerms.join("、")}</p>
+                </div>
+                <div>
+                  <span>数据门槛</span>
+                  <p>
+                    {audienceTemplate.metricRules.requireAvgLikes ? `平均赞≥${audienceTemplate.metricRules.avgLikesThreshold} ` : ""}
+                    {audienceTemplate.metricRules.requireViralWorks ? `爆款≥${audienceTemplate.metricRules.viralLikesThreshold}（${audienceTemplate.metricRules.minViralWorks}条）` : ""}
+                  </p>
+                </div>
+                <div>
+                  <span>校准案例</span>
+                  <p>正例 {audienceTemplate.examples.positive} · 边界 {audienceTemplate.examples.pending} · 负例 {audienceTemplate.examples.negative}</p>
+                </div>
+              </div>
+              <p className="audience-template-note">核心筛选规则已由品牌模板锁定，下方仅可补充少量关键词，不能随意更改。</p>
+            </div>
+          ) : null}
+
           <label>
             <span>任务名称</span>
-            <input value={taskDraft.name} onChange={(event) => updateTaskDraft("name", event.target.value)} />
+            <input value={taskDraft.name} placeholder="例如：通勤裤-蜀黍家" onChange={(event) => updateTaskDraft("name", event.target.value)} />
           </label>
           <label>
             <span>推广产品</span>
@@ -283,33 +379,57 @@ export function AgentClient({
             <input value={taskDraft.category} onChange={(event) => updateTaskDraft("category", event.target.value)} />
           </label>
           <label>
-            <span>目标人群</span>
+            <span>目标人群 {audienceTemplate ? "（模板锁定）" : ""}</span>
             <input
               value={taskDraft.targetAudience}
+              disabled={!!audienceTemplate}
               onChange={(event) => updateTaskDraft("targetAudience", event.target.value)}
             />
           </label>
           <label className="wide">
-            <span>筛选目标说明</span>
+            <span>筛选目标说明 {audienceTemplate ? "（模板锁定）" : ""}</span>
             <textarea
               value={taskDraft.targetDescription}
+              disabled={!!audienceTemplate}
               onChange={(event) => updateTaskDraft("targetDescription", event.target.value)}
             />
           </label>
           <label>
-            <span>采集关键词</span>
+            <span>采集关键词 {audienceTemplate ? "（模板锁定）" : ""}</span>
             <textarea
               value={taskDraft.seedKeywords}
+              disabled={!!audienceTemplate}
               onChange={(event) => updateTaskDraft("seedKeywords", event.target.value)}
             />
           </label>
           <label>
-            <span>排除方向</span>
+            <span>排除方向 {audienceTemplate ? "（模板锁定）" : ""}</span>
             <textarea
               value={taskDraft.excludeKeywords}
+              disabled={!!audienceTemplate}
               onChange={(event) => updateTaskDraft("excludeKeywords", event.target.value)}
             />
           </label>
+          {audienceTemplate ? (
+            <>
+              <label>
+                <span>补充采集关键词（可选，合并进模板规则）</span>
+                <textarea
+                  value={extraSeed}
+                  placeholder="少量补充词，逗号分隔，如：交警、铁路公安"
+                  onChange={(event) => setExtraSeed(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>补充排除词（可选，合并进模板规则）</span>
+                <textarea
+                  value={extraExclude}
+                  placeholder="少量排除词，逗号分隔"
+                  onChange={(event) => setExtraExclude(event.target.value)}
+                />
+              </label>
+            </>
+          ) : null}
           <label>
             <span>产品卖点</span>
             <textarea
@@ -324,45 +444,61 @@ export function AgentClient({
               onChange={(event) => updateTaskDraft("outreachTone", event.target.value)}
             />
           </label>
-        </div>
-      </section>
-
-      {message ? <p className="form-error">{message}</p> : null}
-
-      {selectedTask ? <AgentPipelineDashboard key={selectedTask.id} task={selectedTask} /> : null}
-
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <h2>已有任务</h2>
-            <p>每个任务都是一条独立业务线。后续同一个达人可以在不同任务下有不同结论。</p>
           </div>
-        </div>
 
-        <div className="campaign-task-list">
-          {campaignTasks.length === 0 ? (
-            <p className="empty-state">还没有品类任务。先保存一个，再去达人发现页开始测试。</p>
-          ) : (
-            campaignTasks.map((task) => (
-              <article className="campaign-task-card" key={task.id}>
-                <div>
-                  <strong>{task.name}</strong>
-                  <span>{task.status}</span>
-                </div>
-                <p>{task.targetDescription}</p>
-                <dl>
-                  <div>
-                    <dt>产品</dt>
-                    <dd>{task.productName}</dd>
-                  </div>
-                  <div>
-                    <dt>关键词</dt>
-                    <dd>{task.seedKeywords.slice(0, 8).join("，") || "-"}</dd>
-                  </div>
-                </dl>
-              </article>
-            ))
-          )}
+          <div className="agent-create-actions">
+            <span>保存后会自动切换到新任务。</span>
+            <button onClick={saveCampaignTask} disabled={taskSaving} type="button">
+              {taskSaving ? "保存中..." : "保存任务"}
+            </button>
+          </div>
+        </details>
+        <div className="agent-existing-tasks-inner">
+          <div className="agent-existing-head">
+            <span className="agent-section-kicker">已有任务</span>
+            <h3>已有任务</h3>
+          </div>
+          <div className="campaign-task-list">
+            {campaignTasks.length === 0 ? (
+              <p className="empty-state">还没有任务。先保存一个，再去达人发现页开始测试。</p>
+            ) : (
+              campaignTasks.map((task) => {
+                const isCurrent = String(task.id) === selectedCampaignTaskId;
+                return (
+                  <article
+                    className={`campaign-task-card${isCurrent ? " is-current" : ""}`}
+                    key={task.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSelectedCampaignTaskId(String(task.id))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedCampaignTaskId(String(task.id));
+                      }
+                    }}
+                  >
+                    <div>
+                      <strong>{task.name}</strong>
+                      <span>{task.status}</span>
+                    </div>
+                    <p>{task.targetDescription}</p>
+                    <dl>
+                      <div>
+                        <dt>产品</dt>
+                        <dd>{task.productName}</dd>
+                      </div>
+                      <div>
+                        <dt>关键词</dt>
+                        <dd>{task.seedKeywords.slice(0, 8).join("，") || "-"}</dd>
+                      </div>
+                    </dl>
+                    {isCurrent ? <span className="agent-current-badge">当前任务</span> : null}
+                  </article>
+                );
+              })
+            )}
+          </div>
         </div>
       </section>
     </div>

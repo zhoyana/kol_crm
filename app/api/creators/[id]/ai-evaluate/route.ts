@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { evaluateCreatorWithAi } from "@/lib/ai";
 import { getCreatorById } from "@/lib/creators";
+import { prisma } from "@/lib/prisma";
 
 type RouteContext = {
   params: Promise<{
@@ -26,8 +27,7 @@ export async function POST(_: Request, context: RouteContext) {
 }
 
 async function saveEvaluation(externalId: string, evaluation: Awaited<ReturnType<typeof evaluateCreatorWithAi>>) {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const prisma = new prismaModule.PrismaClient();
+  // prisma singleton from import
   const numericId = Number(externalId);
 
   try {
@@ -53,6 +53,6 @@ async function saveEvaluation(externalId: string, evaluation: Awaited<ReturnType
       }
     });
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }

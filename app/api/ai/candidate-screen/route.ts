@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { DouyinDiscoveryCandidate } from "@/lib/douyin-import";
 import { resolveDiscoveryRuleTemplate, type DiscoveryRuleTemplate } from "@/lib/discovery-rule-templates";
+import { prisma } from "@/lib/prisma";
 
 type CampaignTask = {
   name: string;
@@ -32,13 +33,23 @@ function normalizeTaskId(value: unknown): number | null {
 
 async function loadCampaignTask(id: number | null): Promise<CampaignTask | null> {
   if (!id || !process.env.DATABASE_URL) return null;
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => any;
-  const prisma = new PrismaClient();
+  // prisma singleton from import
   try {
-    return await prisma.campaignTask.findUnique({ where: { id } });
-  } finally {
-    await prisma.$disconnect();
+    const task = await prisma.campaignTask.findUnique({ where: { id } });
+    if (!task) return null;
+    const strings = (value: unknown) => Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+    return {
+      name: task.name,
+      productName: task.productName,
+      category: task.category,
+      targetAudience: task.targetAudience,
+      targetDescription: task.targetDescription,
+      seedKeywords: strings(task.seedKeywords),
+      excludeKeywords: strings(task.excludeKeywords),
+      productSellingPoints: strings(task.productSellingPoints)
+    };
+  } catch {
+    return null;
   }
 }
 

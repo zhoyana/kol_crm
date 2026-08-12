@@ -1,26 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importDouyinCandidates, type DouyinDiscoveryCandidate, type DouyinWork } from "@/lib/douyin-import";
 import { verifyDouyinHomepageCandidateFast, type HomepageReviewRules } from "@/lib/douyin-homepage";
-
-type MiniPrismaClient = {
-  creator: {
-    findFirst: (args: Record<string, unknown>) => Promise<any | null>;
-    update: (args: Record<string, unknown>) => Promise<any>;
-  };
-  campaignTask: {
-    findUnique: (args: Record<string, unknown>) => Promise<any | null>;
-  };
-  creatorCampaignTask: {
-    upsert: (args: Record<string, unknown>) => Promise<any>;
-  };
-  $disconnect: () => Promise<void>;
-};
-
-async function getPrisma(): Promise<MiniPrismaClient> {
-  const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-  const PrismaClient = prismaModule.PrismaClient as new () => MiniPrismaClient;
-  return new PrismaClient();
-}
+import { prisma } from "@/lib/prisma";
 
 function normalizeWorks(works: any[]): DouyinWork[] {
   return works.map((work) => ({
@@ -103,11 +84,13 @@ function toHomepageCampaignTask(task: any): HomepageReviewRules["campaignTask"] 
     seedKeywords: Array.isArray(task.seedKeywords) ? task.seedKeywords : [],
     excludeKeywords: Array.isArray(task.excludeKeywords) ? task.excludeKeywords : [],
     productSellingPoints: Array.isArray(task.productSellingPoints) ? task.productSellingPoints : [],
-    outreachTone: task.outreachTone || null
+    outreachTone: task.outreachTone || null,
+    audienceTemplateId: task.audienceTemplateId ?? null,
+    audienceTemplateSnapshot: (task as any).audienceTemplateSnapshot ?? null
   };
 }
 
-async function writeCampaignReviewResult(prisma: MiniPrismaClient, creatorId: number, campaignTaskId: number | null, result: {
+async function writeCampaignReviewResult(prisma: any, creatorId: number, campaignTaskId: number | null, result: {
   poolStatus: string;
   screeningStatus: string;
   screeningSummary?: string | null;
@@ -155,7 +138,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
   } | null;
   const numericId = Number(id);
   const campaignTaskId = normalizeCampaignTaskId(body?.campaignTaskId);
-  const prisma = await getPrisma();
+  // prisma singleton from import
 
   try {
     const campaignTask = campaignTaskId
@@ -217,6 +200,6 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       screeningSummary: result.candidate.screeningSummary
     });
   } finally {
-    await prisma.$disconnect();
+    // prisma singleton — do not disconnect
   }
 }

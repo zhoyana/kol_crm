@@ -55,9 +55,9 @@ function buildRecommendation(campaignTaskId: number, counts: CampaignTaskSummary
 
   if (counts.pendingReview >= 5) {
     return {
-      title: "先处理待复筛",
-      reason: `还有 ${counts.pendingReview} 个达人等着主页复筛，先把不合适的过滤掉，再推进建联。`,
-      primaryAction: "去达人复筛",
+      title: "先补齐样本并做画像",
+      reason: `还有 ${counts.pendingReview} 个达人等待主页样本补齐和 AI 作品画像，先完成待选库准入。`,
+      primaryAction: "去样本与数据筛选",
       primaryHref: links.review
     };
   }
@@ -83,9 +83,9 @@ function buildRecommendation(campaignTaskId: number, counts: CampaignTaskSummary
   if (counts.candidate >= 10) {
     return {
       title: "整理待选库",
-      reason: "待选库里有一批可观察达人，可以人工降噪、删除、重新复筛或移入精选。",
-      primaryAction: "去达人库",
-      primaryHref: links.creators
+      reason: "待选库里有一批画像通过达人，可以按可选数据门槛批量晋级精选。",
+      primaryAction: "去数据门槛筛选",
+      primaryHref: links.review
     };
   }
 

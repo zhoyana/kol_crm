@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { ensureCdpBrowser, isCdpBrowserAvailable, restartCdpBrowser } from "./cdp-browser";
+import { acquireCdpTaskLock } from "./cdp-task-lock";
 import {
   parseDouyinDiscoveryCandidates,
   toImportCandidate,
@@ -23,6 +25,12 @@ export type HomepageReviewRules = {
   requireViral2000?: boolean;
   requireWorkCount10?: boolean;
   requireRecentViral?: boolean;
+  requireRecentUpdate?: boolean;
+  avgLikesThreshold?: number;
+  viralLikesThreshold?: number;
+  minViralWorks?: number;
+  minSampleWorks?: number;
+  metricMatchMode?: "all" | "any";
   campaignTask?: {
     name?: string;
     productName?: string;
@@ -33,6 +41,8 @@ export type HomepageReviewRules = {
     excludeKeywords?: string[];
     productSellingPoints?: string[];
     outreachTone?: string | null;
+    audienceTemplateId?: number | null;
+    audienceTemplateSnapshot?: unknown;
   };
 };
 
@@ -42,11 +52,16 @@ export type HomepageReviewOptions = {
   skipObviousMismatch?: boolean;
 };
 
-type HomepageBooleanRuleKey = "requireAvgLikes500" | "requireViral2000" | "requireWorkCount10" | "requireRecentViral";
+type HomepageBooleanRuleKey =
+  | "requireAvgLikes500"
+  | "requireViral2000"
+  | "requireWorkCount10"
+  | "requireRecentViral"
+  | "requireRecentUpdate";
 
 type HomepageResult =
-  | { ok: true; candidate: DouyinCandidate }
-  | { ok: false; reason: string };
+  | { ok: true; candidate: DouyinCandidate; aiCalls?: number }
+  | { ok: false; reason: string; aiCalls?: number };
 
 export type HomepageBatchReviewResult = {
   externalId: string;
@@ -79,7 +94,19 @@ function secUidFromCandidate(candidate: DouyinDiscoveryCandidate): string {
   return "";
 }
 
-function runMediaCrawlerCreators(secUids: string[], workLimit = HOMEPAGE_WORK_LIMIT): Promise<void> {
+function isCdpTakeoverFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /connect_over_cdp|无法接管已登录的CDP浏览器|Unable to take control of the logged-in CDP browser|CRAWLER_ZERO_CREATOR_WORKS|Page\.goto:\s*Timeout|navigating to "https:\/\/www\.douyin\.com\/"|ArgusSecurityPlugin|DataFetchError/i.test(message);
+}
+
+async function runMediaCrawlerCreators(secUids: string[], workLimit = HOMEPAGE_WORK_LIMIT): Promise<void> {
+  const uvCommand = process.env.CRAWLER_UV_COMMAND || "uv";
+  const crawlerEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => key !== "VIRTUAL_ENV" && key.toLowerCase() !== "path"
+    )
+  );
+  const crawlerPath = process.env.CRAWLER_PATH || process.env.PATH || process.env.Path || "";
   const args = [
     "run",
     "main.py",
@@ -94,7 +121,7 @@ function runMediaCrawlerCreators(secUids: string[], workLimit = HOMEPAGE_WORK_LI
     "--crawler_max_notes_count",
     String(workLimit),
     "--max_concurrency_num",
-    "2",
+    "1",
     "--get_comment",
     "false",
     "--get_sub_comment",
@@ -103,24 +130,82 @@ function runMediaCrawlerCreators(secUids: string[], workLimit = HOMEPAGE_WORK_LI
     "jsonl"
   ];
 
-  return new Promise((resolve, reject) => {
-    const child = spawn("uv", args, {
+  let activePid: number | null = null;
+  const runOnce = () => new Promise<void>((resolve, reject) => {
+    const timeoutMs = Math.max(30_000, Number(process.env.CRAWLER_CREATOR_TIMEOUT_MS || 90_000));
+    const child = spawn(uvCommand, args, {
       cwd: mediaCrawlerRoot(),
       windowsHide: true,
-      shell: true
+      shell: false,
+      env: {
+        ...crawlerEnvironment,
+        PATH: crawlerPath,
+        PYTHONIOENCODING: "utf-8",
+        KOL_CREATOR_CONCURRENCY: "1"
+      } as unknown as NodeJS.ProcessEnv
     });
+    activePid = child.pid ?? null;
     let stderr = "";
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback();
+    };
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(() => reject(new Error(`MediaCrawler 主页采集超时（${Math.round(timeoutMs / 1000)} 秒）`)));
+    }, timeoutMs);
 
+    child.stdout.on("data", () => undefined);
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => finish(() => reject(error)));
     child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr.trim() || `MediaCrawler exited with code ${code}`));
+      finish(() => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `MediaCrawler exited with code ${code}`));
+      });
     });
   });
+
+  const lease = await acquireCdpTaskLock({
+    taskType: "homepage_portrait",
+    taskId: `portrait-${Date.now()}-${secUids[0] || "unknown"}`,
+    detail: `${secUids.length} 位达人`,
+    onWait: (owner) => {
+      console.info(
+        `[cdp-lock] 主页画像等待采集资源；当前占用：${owner?.taskType || "未知任务"} ${owner?.detail || ""}`
+      );
+    }
+  });
+  try {
+    await ensureCdpBrowser();
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const running = runOnce();
+        await lease.setPid(activePid);
+        await running;
+        break;
+      } catch (error) {
+        if (attempt >= maxAttempts) throw error;
+        if (isCdpTakeoverFailure(error)) {
+          console.warn(`[homepage-crawler] CDP 接管或抖音导航临时失败，正在重启专用 Chrome 并重试当前批次（${attempt + 1}/${maxAttempts}）。`);
+          await restartCdpBrowser();
+        } else {
+          if (await isCdpBrowserAvailable()) throw error;
+          await ensureCdpBrowser();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+      }
+    }
+  } finally {
+    await lease.release();
+  }
 }
 
 function runMediaCrawlerCreator(secUid: string, workLimit = HOMEPAGE_WORK_LIMIT): Promise<void> {
@@ -371,7 +456,7 @@ function buildHomepageAiPrompt(input: {
   ].join("\n");
 
   return [
-    "你是达人主页复筛助手。请根据作者主页最近作品标题集合，判断这个账号整体是否符合当前建联目标。",
+    "你是达人作品画像初筛助手。请根据作者主页最近作品标题集合，判断这个账号整体是否符合当前品类的目标画像。",
     "",
     targetContext,
     templateNotes,
@@ -388,8 +473,8 @@ function buildHomepageAiPrompt(input: {
     "6. 学习、实习、规培、上岸、入职、毕业等记录如果指向作者本人属于当前目标人群，应视为目标线索；只有主营备考咨询、分数线、报考规划、培训课程的账号才 reject。",
     "7. 颜值、自拍、穿搭、健身、情绪文案不是天然负面；如果账号同时有当前任务目标人群身份线索，并且互动数据不错，这类个人号可以 pass。",
     "",
-    "应该通过 pass：明显符合当前品类任务的目标人群，且不是商品/运营/服务账号；内容能体现真实个人身份、日常场景、工作/学习/生活记录或与产品自然结合的场景。",
-    "可以待观察 maybe：有当前任务目标人群线索，但主页样本少、标题抽象、垂直度不够确定；或主页多数是vlog/日常但仍像个人账号；或看起来可能是公司运营/商品号但还需人工确认。",
+    "应该通过 pass：明显符合当前品类任务的目标人群，且不是商品/运营/服务账号；内容能体现真实个人身份、日常场景、工作/学习/生活记录或与产品自然结合的场景。pass 只代表进入待选库，不代表数据表现已达到精选门槛。",
+    "可以待观察 maybe：有当前任务目标人群线索，但主页样本少、标题抽象、垂直度不够确定；信息不足时必须 maybe，等待补采或人工确认，不能硬猜。",
     "必须拒绝 reject：官方/媒体/机构/营销/蓝V黄V；主营报考招生培训/考试咨询/课程售卖的账号；纯科普引流、商品带货、公司运营、服务号；明显不是当前任务目标人群且缺少目标身份线索。",
     "特别注意：不要因为单条泛内容直接 reject，要看主页整体是否符合当前任务目标人群。",
     "如果简介、昵称或作品标题明显命中当前任务排除方向，即使点赞很高，也应 reject。",
@@ -435,42 +520,58 @@ async function requestHomepageAiDecision(input: {
   viralWorkCount: number;
   hasRecentUpdate: boolean;
   campaignTask?: HomepageReviewRules["campaignTask"];
-}): Promise<HomepageAiDecision | null> {
+}): Promise<{ decision: HomepageAiDecision | null; aiCalls: number }> {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey || !input.recentWorks.length) return null;
+  if (!apiKey || !input.recentWorks.length) return { decision: null, aiCalls: 0 };
 
   const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "你只输出可解析 JSON。" },
-        { role: "user", content: buildHomepageAiPrompt(input) }
-      ]
-    })
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "你只输出可解析 JSON。" },
+          { role: "user", content: buildHomepageAiPrompt(input) }
+        ]
+      }),
+      signal: AbortSignal.timeout(60_000)
+    });
+  } catch (error) {
+    console.error(
+      `[homepage-ai] ${input.original.externalId} 请求失败：`,
+      error instanceof Error ? error.message : error
+    );
+    return { decision: null, aiCalls: 1 };
+  }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    console.error(`[homepage-ai] ${input.original.externalId} HTTP ${response.status}`);
+    return { decision: null, aiCalls: 1 };
+  }
   const data = await response.json().catch(() => null);
   const parsed = safeJsonObject(String(data?.choices?.[0]?.message?.content || ""));
   const positiveSignals = Array.isArray(parsed.positiveSignals) ? parsed.positiveSignals.map(String) : [];
   const negativeSignals = Array.isArray(parsed.negativeSignals) ? parsed.negativeSignals.map(String) : [];
 
   return {
-    decision: normalizeHomepageAiDecision(parsed.decision),
-    confidence: Math.max(0, Math.min(Number(parsed.confidence || 0.5), 1)),
-    accountType: normalizeHomepageAccountType(parsed.accountType),
-    reason: String(parsed.reason || "AI 未给出明确原因"),
-    positiveSignals,
-    negativeSignals
+    aiCalls: 1,
+    decision: {
+      decision: normalizeHomepageAiDecision(parsed.decision),
+      confidence: Math.max(0, Math.min(Number(parsed.confidence || 0.5), 1)),
+      accountType: normalizeHomepageAccountType(parsed.accountType),
+      reason: String(parsed.reason || "AI 未给出明确原因"),
+      positiveSignals,
+      negativeSignals
+    }
   };
 }
 
@@ -486,6 +587,44 @@ function countWorksByTerms(works: DouyinWork[], terms: string[]): number {
   return works.filter((work) => includesAny(normalizedText(work.title), terms)).length;
 }
 
+function countExplicitPersonalLifestyleWorks(works: DouyinWork[]): number {
+  return countWorksByTerms(works, [
+    "自拍",
+    "宿舍生活",
+    "宿舍日常",
+    "通勤记录",
+    "下班后",
+    "下班去",
+    "下班生活",
+    "和朋友",
+    "朋友聚会",
+    "朋友一起",
+    "闺蜜",
+    "同学聚会",
+    "旅行",
+    "旅游",
+    "宠物",
+    "猫咪",
+    "狗狗",
+    "探店",
+    "聚餐",
+    "美食",
+    "做饭",
+    "吃播",
+    "逛街",
+    "健身",
+    "毕业旅行",
+    "日常生活",
+    "生活碎片",
+    "跳舞",
+    "舞蹈",
+    "约会",
+    "恋爱",
+    "回家过年",
+    "周末出游"
+  ]);
+}
+
 function medicalHomepageHardRejectReason(
   original: DouyinDiscoveryCandidate,
   homepage: DouyinDiscoveryCandidate,
@@ -495,10 +634,8 @@ function medicalHomepageHardRejectReason(
     [
       original.name,
       original.sampleTitle || "",
-      original.notes || "",
       homepage.name,
-      homepage.sampleTitle || "",
-      homepage.notes || ""
+      homepage.sampleTitle || ""
     ].join(" ")
   );
   const examAccountTerms = [
@@ -545,10 +682,73 @@ function medicalHomepageHardRejectReason(
     return `最近 ${works.length} 条中有 ${examWorkCount} 条以护考、报考或求职考试为主，属于考试就业知识账号。`;
   }
 
+  const educationAccountTerms = [
+    "护理老师",
+    "护理教师",
+    "护理讲师",
+    "教护理",
+    "护考老师",
+    "医学老师"
+  ];
+  const scienceAndTeachingTerms = [
+    "科普",
+    "健康知识",
+    "医学知识",
+    "疾病",
+    "症状",
+    "治疗",
+    "误区",
+    "血管",
+    "血压",
+    "一分钟了解",
+    "护理教学",
+    "护理操作",
+    "操作流程",
+    "处理流程",
+    "一次讲清",
+    "讲透",
+    "知识点",
+    "实习必做",
+    "实习须知",
+    "实习注意",
+    "注射",
+    "打针",
+    "导尿",
+    "插管",
+    "备考",
+    "教资",
+    "护资",
+    "考试"
+  ];
+  const scienceAndTeachingCount = countWorksByTerms(works, scienceAndTeachingTerms);
+  const personalLifestyleCount = countExplicitPersonalLifestyleWorks(works);
+  if (
+    includesAny(accountText, educationAccountTerms) &&
+    works.length >= 6 &&
+    scienceAndTeachingCount >= 3
+  ) {
+    return `账号定位为护理/医学教学，最近作品以教学、实习答疑或考试内容为主，粉丝受众不符合医护小熊。`;
+  }
+  if (
+    works.length >= 8 &&
+    scienceAndTeachingCount >= Math.max(3, Math.ceil(works.length * 0.35)) &&
+    personalLifestyleCount < 2
+  ) {
+    return `最近 ${works.length} 条中有 ${scienceAndTeachingCount} 条为医学科普或护理教学，且个人生活内容不足，粉丝受众不符合医护小熊。`;
+  }
+  if (works.length >= 8 && personalLifestyleCount < 2) {
+    return `最近 ${works.length} 条中明确的非职业个人生活内容仅 ${personalLifestyleCount} 条；主页以医护工作、学业或职业经历为主，不符合医护小熊精选要求。`;
+  }
   const entertainmentTerms = [
     "段子",
     "剧情",
     "演绎",
+    "短剧",
+    "剧本",
+    "情景剧",
+    "角色扮演",
+    "一人分饰",
+    "连续剧",
     "搞笑",
     "哈哈",
     "班搭子",
@@ -563,32 +763,52 @@ function medicalHomepageHardRejectReason(
     "熬夜",
     "温柔对待"
   ];
-  const substantiveMedicalTerms = [
-    "医院",
-    "病房",
-    "科室",
-    "查房",
-    "交班",
-    "接班",
-    "值班",
-    "夜班",
-    "急诊",
-    "门诊",
-    "手术室",
-    "护理操作",
-    "输液",
-    "实习",
-    "规培",
-    "轮转"
+  const explicitStagedTerms = [
+    "剧情演绎",
+    "情景演绎",
+    "情景剧",
+    "短剧",
+    "剧本",
+    "角色扮演",
+    "一人分饰",
+    "连续剧"
+  ];
+  const vlogTerms = [
+    "vlog",
+    "日常生活记录",
+    "生活记录",
+    "日常记录",
+    "旅行记录",
+    "宠物日常",
+    "猫咪日常",
+    "我的一天"
   ];
   const entertainmentCount = countWorksByTerms(works, entertainmentTerms);
-  const substantiveMedicalCount = countWorksByTerms(works, substantiveMedicalTerms);
+  const explicitStagedCount = countWorksByTerms(works, explicitStagedTerms);
+  const vlogCount = countWorksByTerms(works, vlogTerms);
+  if (
+    works.length >= 6 &&
+    (
+      explicitStagedCount >= 2 ||
+      (
+        explicitStagedCount >= 1 &&
+        entertainmentCount >= Math.ceil(works.length * 0.3)
+      )
+    )
+  ) {
+    return `最近 ${works.length} 条以剧情演绎、角色扮演或剧本内容为主，不属于真实医护个人日常。`;
+  }
   if (
     works.length >= 8 &&
-    entertainmentCount >= Math.ceil(works.length * 0.5) &&
-    substantiveMedicalCount < Math.ceil(works.length * 0.3)
+    entertainmentCount >= Math.ceil(works.length * 0.5)
   ) {
-    return `最近 ${works.length} 条以泛娱乐段子/表演为主，真实医护工作内容仅 ${substantiveMedicalCount} 条，职业标签只是内容包装。`;
+    return `最近 ${works.length} 条中有 ${entertainmentCount} 条以泛娱乐段子/表演为主，不属于真实医护个人日常。`;
+  }
+  if (
+    works.length >= 8 &&
+    vlogCount >= Math.ceil(works.length * 0.6)
+  ) {
+    return `最近 ${works.length} 条中有 ${vlogCount} 条为 Vlog/生活记录，内容结构过度单一，不符合医护小熊精选要求。`;
   }
 
   return null;
@@ -685,7 +905,6 @@ function medicalFeaturedBlockReason(original: DouyinDiscoveryCandidate, works: D
   const medicalTemplate = resolveDiscoveryRuleTemplate({ name: "医护小熊" }).homepageReview;
   const dailyCount = countWorksByTerms(works, medicalTemplate.dailyTerms);
   const identityCount = countWorksByTerms(works, medicalTemplate.identityTerms);
-  const lifestyleCount = countWorksByTerms(works, medicalTemplate.lifestyleTerms);
   const adviceCount = countWorksByTerms(works, medicalTemplate.dominantRejectTerms);
 
 
@@ -695,10 +914,6 @@ function medicalFeaturedBlockReason(original: DouyinDiscoveryCandidate, works: D
 
   if (identityCount < 3) {
     return "医护小熊精选需要稳定的本人医护身份或工作/学习场景，当前身份信号不足，降为待选。";
-  }
-
-  if (lifestyleCount < 2) {
-    return "医护小熊精选必须同时出现明确的非医护个人生活分享；当前主页主要是医护内容或口播，降为待选。";
   }
 
   if (adviceCount >= Math.ceil(works.length * 0.6)) {
@@ -717,9 +932,6 @@ function medicalFeaturedBlockReason(original: DouyinDiscoveryCandidate, works: D
     return "医护小熊精选需要稳定的本人医护身份或工作/学习场景，当前主页的身份信号不足，降为待选。";
   }
 
-  if (works.length >= 4 && lifestyleCount < 2) {
-    return "医护小熊精选需要同时看到真实的个人生活分享和医护内容；当前主页偏单一医护内容，降为待选。";
-  }
   return null;
 }
 
@@ -1024,7 +1236,7 @@ async function withHomepageDecision(
   homepage: DouyinDiscoveryCandidate,
   rules?: HomepageReviewRules,
   workLimit = HOMEPAGE_WORK_LIMIT
-): Promise<DouyinCandidate | null> {
+): Promise<HomepageResult> {
   const recentWorks = homepage.works.slice(0, workLimit);
   const hardHomepageAccountTypes = [
     "official",
@@ -1046,11 +1258,13 @@ async function withHomepageDecision(
     original.fans >= 100_000 ||
     homepage.fans >= 100_000
   ) {
-    return null;
+    const reason = original.rejectReason || homepage.rejectReason
+      || (original.fans >= 100_000 || homepage.fans >= 100_000 ? "粉丝数达到或超过10万，命中大V硬排除" : "账号类型命中机构、媒体、认证号或营销培训硬排除");
+    return { ok: false, reason: `${original.name || homepage.name}：${reason}`, aiCalls: 0 };
   }
   const hasRecentUpdate = recentWorks.some(isRecentWork);
   const hasActiveUpdate = recentWorks.some(isActiveWork);
-  if (!hasActiveUpdate) return null;
+  if (!hasActiveUpdate) return { ok: false, reason: `${original.name || homepage.name}：最近3个月没有有效更新`, aiCalls: 0 };
 
   const avgLikes = recentWorks.length
     ? Math.round(recentWorks.reduce((sum, work) => sum + work.likeCount, 0) / recentWorks.length)
@@ -1062,10 +1276,11 @@ async function withHomepageDecision(
   const workCount = recentWorks.length;
   const discoveryTemplate = resolveDiscoveryRuleTemplate(rules?.campaignTask);
   const isMedicalBear = discoveryTemplate.id === "medical-bear";
-  if (isMedicalBear && medicalHomepageHardRejectReason(original, homepage, recentWorks)) {
-    return null;
+  const medicalHardRejectReason = isMedicalBear ? medicalHomepageHardRejectReason(original, homepage, recentWorks) : null;
+  if (medicalHardRejectReason) {
+    return { ok: false, reason: `${original.name || homepage.name}：医护画像硬排除——${medicalHardRejectReason}`, aiCalls: 0 };
   }
-  const aiDecision = await requestHomepageAiDecision({
+  const aiResult = await requestHomepageAiDecision({
     original,
     recentWorks,
     avgLikes,
@@ -1074,65 +1289,40 @@ async function withHomepageDecision(
     hasRecentUpdate,
     campaignTask: rules?.campaignTask
   });
+  const aiDecision = aiResult.decision;
 
   const keepReason = candidateKeepReason(original, recentWorks, rules?.campaignTask);
-  const keepDespiteAiReject = aiDecision?.decision === "reject" && Boolean(keepReason) && !isMedicalBear;
-  if (aiDecision?.decision === "reject" && !keepDespiteAiReject) return null;
-  const featuredBlockReason = nonFeaturedReason(original, recentWorks, rules?.campaignTask);
-  const hasStrongTaskIdentity = Boolean(keepReason);
-  const hardAiRejectTypes = [
-    "official_media",
-    "working_police",
-    "education_training",
-    "marketing"
-  ];
-  const hardAiRejected = aiDecision?.decision === "reject" && hardAiRejectTypes.includes(aiDecision.accountType);
-
-  const requiresAvgLikes = isRuleEnabled(rules, "requireAvgLikes500", true);
-  const requiresViralWork = isRuleEnabled(rules, "requireViral2000", true);
-  const engagementMatched = isMedicalBear && requiresAvgLikes && requiresViralWork
-    ? avgLikes >= 300 || hasViralWork
-    : (!requiresAvgLikes || avgLikes > MIN_AVG_LIKES) && (!requiresViralWork || hasViralWork);
-
-  const matchedFeaturedRules = [
-    engagementMatched,
-    !isRuleEnabled(rules, "requireWorkCount10", false) || workCount > 10,
-    !isRuleEnabled(rules, "requireRecentViral", false) || hasRecentViralWork,
-    hasActiveUpdate
-  ].every(Boolean);
-
-  let poolStatus = "candidate";
-  let screeningStatus = "candidate_observe";
-  const aiAllowsFeatured =
-    aiDecision?.decision === "pass" ||
-    (aiDecision?.decision !== "reject" &&
-      hasStrongTaskIdentity &&
-      engagementMatched &&
-      (!isMedicalBear || hasViralWork || avgLikes >= 300) &&
-      !hardAiRejected);
-
-  if (matchedFeaturedRules && aiAllowsFeatured && !featuredBlockReason) {
-    poolStatus = "featured";
-    screeningStatus = hasRecentViralWork ? "featured_trending" : "featured_stable";
-  } else if (hasViralWork && avgLikes > MIN_AVG_LIKES) {
-    screeningStatus = "candidate_potential";
+  if (aiDecision?.decision === "reject") {
+    return { ok: false, reason: `${original.name || homepage.name}：AI画像排除——${aiDecision.reason}`, aiCalls: aiResult.aiCalls };
   }
+  const portraitConcern = nonFeaturedReason(original, recentWorks, rules?.campaignTask);
+  const portraitPassed = aiDecision?.decision === "pass" && !portraitConcern;
+  const poolStatus = portraitPassed ? "candidate" : "pending_review";
+  const screeningStatus = portraitPassed ? "portrait_passed" : "portrait_insufficient";
+  const sortedLikes = recentWorks.map((work) => work.likeCount).sort((a, b) => a - b);
+  const medianLikes = sortedLikes.length
+    ? sortedLikes.length % 2
+      ? sortedLikes[Math.floor(sortedLikes.length / 2)]
+      : Math.round((sortedLikes[sortedLikes.length / 2 - 1] + sortedLikes[sortedLikes.length / 2]) / 2)
+    : 0;
 
   const screeningSummary = [
-    `主页复筛通过：最近${workCount}条作品中${hasRecentUpdate ? "近1个月有更新" : "近1个月未确认更新，但近3个月有更新"}`,
-    aiDecision ? `AI账号画像：${aiDecision.decision}，${aiDecision.reason}` : "AI账号画像：未启用，按规则进入待确认",
-    keepDespiteAiReject && keepReason ? `AI未通过精选判断，但保留待选：${keepReason}` : "",
-    aiDecision?.decision !== "pass" && aiAllowsFeatured ? `AI未明确通过，但${campaignTaskLabel(rules?.campaignTask)}与数据表现较强，允许进入精选` : "",
-    featuredBlockReason ? `非精选原因：${featuredBlockReason}` : "",
-    hasViralWork ? "出现点赞超过2000的爆款作品" : "未发现点赞超过2000的爆款作品",
-    `主页样本平均点赞 ${avgLikes}`,
-    workCount > 10 ? "作品数超过10" : "作品数不超过10",
+    `主页样本已补齐：最近${workCount}条作品中${hasRecentUpdate ? "近1个月有更新" : "近1个月未确认更新，但近3个月有更新"}`,
+    aiDecision ? `AI作品画像：${aiDecision.decision}，${aiDecision.reason}` : "AI作品画像：接口未启用或未返回结果，标记为信息不足",
+    aiDecision?.decision === "maybe" && keepReason ? `存在目标身份线索，但 AI 证据不足：${keepReason}` : "",
+    portraitConcern ? `规则提示：${portraitConcern}` : "",
+    portraitPassed ? "画像符合，进入待选库" : "画像证据不足，等待补采或人工确认",
+    hasViralWork ? "出现点赞超过2000的作品" : "未发现点赞超过2000的作品",
+    `主页样本平均点赞 ${avgLikes}，中位点赞 ${medianLikes}，最高点赞 ${maxLikes}`,
     hasRecentViralWork ? "近1个月出现爆款" : "近1个月未发现爆款",
-    matchedFeaturedRules ? "命中当前勾选规则，进入精选库" : "未完全命中当前勾选规则，进入待选库"
+    "数据指标已记录，精选阶段不再重复打开主页"
   ].filter(Boolean).join("；");
 
   return {
-    ...toImportCandidate(homepage),
+    ok: true,
+    aiCalls: aiResult.aiCalls,
+    candidate: {
+      ...toImportCandidate(homepage),
     name: original.name || homepage.name,
     profileUrl: original.profileUrl || homepage.profileUrl,
     category: original.category || homepage.category,
@@ -1148,7 +1338,94 @@ async function withHomepageDecision(
     viralWorkCount,
     works: recentWorks,
     plays: recentWorks.map((work) => work.likeCount).filter((value) => value > 0),
-    notes: `${original.notes || ""}\n\n${screeningSummary}`.trim()
+      notes: `${original.notes || ""}\n\n${screeningSummary}`.trim()
+    }
+  };
+}
+
+export function applyHomepageMetricRules(
+  candidate: DouyinDiscoveryCandidate,
+  rules?: HomepageReviewRules
+): DouyinCandidate {
+  const works = candidate.works || [];
+  const avgLikesThreshold = Math.max(0, Number(rules?.avgLikesThreshold ?? 500));
+  const viralLikesThreshold = Math.max(0, Number(rules?.viralLikesThreshold ?? 2000));
+  const minViralWorks = Math.max(1, Number(rules?.minViralWorks ?? 1));
+  const minSampleWorks = Math.max(1, Number(rules?.minSampleWorks ?? 10));
+  const viralWorks = works.filter((work) => work.likeCount > viralLikesThreshold);
+  const recentViralWorks = viralWorks.filter(isRecentWork);
+  const recentWorks = works.filter(isRecentWork);
+  const discoveryTemplate = resolveDiscoveryRuleTemplate(rules?.campaignTask);
+  const semanticRejectReason = discoveryTemplate.id === "medical-bear"
+    ? medicalHomepageHardRejectReason(candidate, candidate, works)
+    : null;
+
+  if (semanticRejectReason) {
+    const screeningSummary = [
+      candidate.screeningSummary || "",
+      `内容类型复核未通过：${semanticRejectReason}`,
+      "本次仅使用数据库已有主页作品重算，未重新采集、未重新调用 AI"
+    ].filter(Boolean).join("；");
+    return {
+      ...toImportCandidate(candidate),
+      poolStatus: "rejected",
+      screeningStatus: "portrait_rejected",
+      screeningSummary,
+      notes: `${candidate.notes || ""}\n\n${screeningSummary}`.trim()
+    };
+  }
+
+  if (candidate.screeningStatus !== "portrait_passed" || candidate.poolStatus !== "candidate") {
+    return {
+      ...toImportCandidate(candidate),
+      poolStatus: candidate.poolStatus,
+      screeningStatus: candidate.screeningStatus,
+      screeningSummary: `${candidate.screeningSummary || ""}；画像尚未通过，未执行数据门槛晋级`
+    };
+  }
+
+  const requiresAvgLikes = isRuleEnabled(rules, "requireAvgLikes500", true);
+  const requiresViralWork = isRuleEnabled(rules, "requireViral2000", true);
+  const engagementChecks = [
+    ...(requiresAvgLikes ? [candidate.avgLikes > avgLikesThreshold] : []),
+    ...(requiresViralWork ? [viralWorks.length >= minViralWorks] : [])
+  ];
+  const engagementMatched = engagementChecks.length === 0
+    ? true
+    : rules?.metricMatchMode === "any"
+      ? engagementChecks.some(Boolean)
+      : engagementChecks.every(Boolean);
+  const checks = [
+    engagementMatched,
+    !isRuleEnabled(rules, "requireWorkCount10", false) || works.length >= minSampleWorks,
+    !isRuleEnabled(rules, "requireRecentViral", false) || recentViralWorks.length >= minViralWorks,
+    !isRuleEnabled(rules, "requireRecentUpdate", false) || recentWorks.length > 0
+  ];
+  const matched = checks.every(Boolean);
+  const screeningStatus = matched
+    ? recentViralWorks.length
+      ? "featured_trending"
+      : "featured_stable"
+    : candidate.avgLikes > avgLikesThreshold || viralWorks.length
+      ? "candidate_potential"
+      : "candidate_observe";
+  const ruleSummary = [
+    requiresAvgLikes ? `平均点赞 > ${avgLikesThreshold}：${candidate.avgLikes > avgLikesThreshold ? "通过" : "未通过"}` : "",
+    requiresViralWork ? `点赞 > ${viralLikesThreshold} 的作品至少 ${minViralWorks} 条：${viralWorks.length >= minViralWorks ? "通过" : "未通过"}` : "",
+    isRuleEnabled(rules, "requireWorkCount10", false) ? `主页样本至少 ${minSampleWorks} 条：${works.length >= minSampleWorks ? "通过" : "未通过"}` : "",
+    isRuleEnabled(rules, "requireRecentViral", false) ? `近1个月爆款：${recentViralWorks.length ? "通过" : "未通过"}` : "",
+    isRuleEnabled(rules, "requireRecentUpdate", false) ? `近1个月更新：${recentWorks.length ? "通过" : "未通过"}` : ""
+  ].filter(Boolean);
+
+  return {
+    ...toImportCandidate(candidate),
+    poolStatus: matched ? "featured" : "candidate",
+    screeningStatus,
+    screeningSummary: [
+      candidate.screeningSummary || "",
+      ruleSummary.length ? `数据门槛：${ruleSummary.join("；")}` : "未启用数据门槛，画像通过后直接进入精选",
+      matched ? "数据门槛通过，进入精选库" : "数据门槛未完全通过，留在待选库"
+    ].filter(Boolean).join("；")
   };
 }
 
@@ -1173,7 +1450,8 @@ export async function verifyDouyinHomepageCandidate(
 
   const content = await readRecentCreatorRows(secUid, startedAt);
   const homepageCandidates = parseDouyinDiscoveryCandidates(content, candidate.category || "未分类", {
-    requireRecentQualified: false
+    requireRecentQualified: false,
+    includeRejected: true
   });
   const homepageCandidate = homepageCandidates.find((item) => item.secUid === secUid || item.creatorId === secUid) || homepageCandidates[0];
 
@@ -1182,11 +1460,7 @@ export async function verifyDouyinHomepageCandidate(
   }
 
   const verified = await withHomepageDecision(candidate, homepageCandidate, rules);
-  if (!verified) {
-    return { ok: false, reason: `${candidate.name} 主页整体画像不符合或最近3个月无有效更新，跳过` };
-  }
-
-  return { ok: true, candidate: verified };
+  return verified;
 }
 
 async function verifyDouyinHomepageCandidateWithLimit(
@@ -1211,7 +1485,8 @@ async function verifyDouyinHomepageCandidateWithLimit(
 
   const content = await readRecentCreatorRows(secUid, startedAt);
   const homepageCandidates = parseDouyinDiscoveryCandidates(content, candidate.category || "未分类", {
-    requireRecentQualified: false
+    requireRecentQualified: false,
+    includeRejected: true
   });
   const homepageCandidate = homepageCandidates.find((item) => item.secUid === secUid || item.creatorId === secUid) || homepageCandidates[0];
 
@@ -1220,11 +1495,7 @@ async function verifyDouyinHomepageCandidateWithLimit(
   }
 
   const verified = await withHomepageDecision(candidate, homepageCandidate, rules, workLimit);
-  if (!verified) {
-    return { ok: false, reason: `${candidate.name} 主页整体画像不符合或最近3个月无有效更新，跳过` };
-  }
-
-  return { ok: true, candidate: verified };
+  return verified;
 }
 
 export async function verifyDouyinHomepageCandidateFast(
@@ -1254,7 +1525,7 @@ export async function verifyDouyinHomepageCandidateFast(
   const needsFullRetry =
     Boolean(options.allowFullRetry) &&
     workLimit < HOMEPAGE_WORK_LIMIT &&
-    (lightResult.candidate.screeningStatus === "candidate_observe" ||
+    (lightResult.candidate.screeningStatus === "portrait_insufficient" ||
       isRuleEnabled(rules, "requireWorkCount10", false) ||
       isRuleEnabled(rules, "requireRecentViral", false));
 
@@ -1307,32 +1578,35 @@ export async function verifyDouyinHomepageCandidatesBatch(
     const retryRowsBySecUid = providedRows || await readRecentCreatorRowsBySecUid(retrySecUids, rowsStartedAt);
 
     return Promise.all(items.map(async (item) => {
-      const content = retryRowsBySecUid.get(item.secUid.toLowerCase()) || "";
-      const homepageCandidates = parseDouyinDiscoveryCandidates(content, item.candidate.category || "未分类", {
-        requireRecentQualified: false
-      });
-      const homepageCandidate =
-        homepageCandidates.find((candidate) => candidate.secUid === item.secUid || candidate.creatorId === item.secUid) || homepageCandidates[0];
+      try {
+        const content = retryRowsBySecUid.get(item.secUid.toLowerCase()) || "";
+        const homepageCandidates = parseDouyinDiscoveryCandidates(content, item.candidate.category || "未分类", {
+          requireRecentQualified: false,
+          includeRejected: true
+        });
+        const homepageCandidate =
+          homepageCandidates.find((candidate) => candidate.secUid === item.secUid || candidate.creatorId === item.secUid) || homepageCandidates[0];
 
-      if (!homepageCandidate?.works.length) {
+        if (!homepageCandidate?.works.length) {
+          return {
+            externalId: item.candidate.externalId,
+            result: { ok: false as const, reason: `${item.candidate.name} 未读取到主页作品，跳过` }
+          };
+        }
+
+        const verified = await withHomepageDecision(item.candidate, homepageCandidate, rules, limit);
         return {
           externalId: item.candidate.externalId,
-          result: { ok: false as const, reason: `${item.candidate.name} 未读取到主页作品，跳过` }
+          result: verified
         };
-      }
-
-      const verified = await withHomepageDecision(item.candidate, homepageCandidate, rules, limit);
-      if (!verified) {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "未知错误";
+        console.error(`[homepage-review] ${item.candidate.externalId} 画像失败：`, message);
         return {
           externalId: item.candidate.externalId,
-          result: { ok: false as const, reason: `${item.candidate.name} 主页整体画像不符合或最近3个月无有效更新，跳过` }
+          result: { ok: false as const, reason: `${item.candidate.name} 画像处理失败：${message}` }
         };
       }
-
-      return {
-        externalId: item.candidate.externalId,
-        result: { ok: true as const, candidate: verified }
-      };
     }));
   }
 
@@ -1347,12 +1621,34 @@ export async function verifyDouyinHomepageCandidatesBatch(
     try {
       await runMediaCrawlerCreators(secUids, workLimit);
       freshlyReviewed = await reviewItems(uncachedItems, workLimit, startedAt);
+      const unreadableCount = freshlyReviewed.filter(
+        (item) => !item.result.ok && /未读取到主页作品/.test(item.result.reason)
+      ).length;
+      const unhealthyThreshold = Math.max(2, Math.ceil(uncachedItems.length * 0.5));
+      if (unreadableCount >= unhealthyThreshold) {
+        console.warn(
+          `[homepage-review] 主页采集有效率偏低：本批 ${uncachedItems.length} 位需补采达人中有 ${unreadableCount} 位未读取到主页作品。` +
+          "继续处理有效达人；空返回账号保留在采集不完整队列，不写成画像信息不足。"
+        );
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "未知错误";
-      freshlyReviewed = uncachedItems.map((item) => ({
-        externalId: item.candidate.externalId,
-        result: { ok: false as const, reason: `${item.candidate.name} 主页批量采集失败：${message}` }
-      }));
+      const batchMessage = error instanceof Error ? error.message : "未知错误";
+      console.warn(`[homepage-review] 批量主页采集失败，降级为逐人采集：${batchMessage}`);
+      const fallbackResults: HomepageBatchReviewResult[] = [];
+      for (const item of uncachedItems) {
+        const itemStartedAt = Date.now();
+        try {
+          await runMediaCrawlerCreators([item.secUid], workLimit);
+          fallbackResults.push(...await reviewItems([item], workLimit, itemStartedAt));
+        } catch (itemError) {
+          const itemMessage = itemError instanceof Error ? itemError.message : "未知错误";
+          fallbackResults.push({
+            externalId: item.candidate.externalId,
+            result: { ok: false, reason: `${item.candidate.name} 主页采集失败：${itemMessage}` }
+          });
+        }
+      }
+      freshlyReviewed = fallbackResults;
     }
   }
   const reviewed = [...cachedReviewed, ...freshlyReviewed];
@@ -1362,7 +1658,7 @@ export async function verifyDouyinHomepageCandidatesBatch(
         const result = reviewed.find((review) => review.externalId === item.candidate.externalId)?.result;
         if (!result) return false;
         if (!result.ok) return true;
-        return result.candidate.screeningStatus === "candidate_observe";
+        return result.candidate.screeningStatus === "portrait_insufficient";
       })
     : [];
 
@@ -1372,8 +1668,21 @@ export async function verifyDouyinHomepageCandidatesBatch(
       await runMediaCrawlerCreators(Array.from(new Set(retryItems.map((item) => item.secUid))), HOMEPAGE_WORK_LIMIT);
       const retryReviewed = await reviewItems(retryItems, HOMEPAGE_WORK_LIMIT, retryStartedAt);
       const retryMap = new Map(retryReviewed.map((item) => [item.externalId, item]));
-      return [...immediateResults, ...reviewed.map((item) => retryMap.get(item.externalId) || item)];
-    } catch {
+      return [...immediateResults, ...reviewed.map((item) => {
+        const retried = retryMap.get(item.externalId);
+        if (!retried) return item;
+        return {
+          ...retried,
+          result: {
+            ...retried.result,
+            aiCalls: Number(item.result.aiCalls || 0) + Number(retried.result.aiCalls || 0)
+          }
+        };
+      })];
+    } catch (error) {
+      console.warn(
+        `[homepage-review] 完整样本重试失败，保留首轮画像结果：${error instanceof Error ? error.message : "未知错误"}`
+      );
       return [...immediateResults, ...reviewed];
     }
   }

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
 
 type RouteContext = {
   params: Promise<{
@@ -32,8 +33,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   }
 
   try {
-    const prismaModule = await new Function("specifier", "return import(specifier)")("@prisma/client");
-    const prisma = new prismaModule.PrismaClient();
+    // prisma singleton from import
     const numericId = Number(id);
 
     try {
@@ -124,7 +124,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
         }
       });
     } finally {
-      await prisma.$disconnect();
+      // prisma singleton — do not disconnect
     }
   } catch (error) {
     console.error(error);
