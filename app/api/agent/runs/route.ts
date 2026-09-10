@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { DEFAULT_AGENT_GOAL, normalizeAgentGoal, type AgentGoal } from "@/lib/agent-goals";
+import { DEFAULT_AGENT_GOAL, normalizeAgentGoal, normalizeAgentMetricRules, type AgentGoal, type AgentMetricRules } from "@/lib/agent-goals";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
@@ -31,6 +31,7 @@ type PipelineSnapshot = {
   metrics: Record<string, StepMetric>;
   logs: string[];
   goal: AgentGoal;
+  metricRules: AgentMetricRules | null;
   usage: {
     collectedWorks: number;
     aiCalls: number;
@@ -66,6 +67,7 @@ function cleanSnapshot(value: any): PipelineSnapshot {
     metrics,
     logs: Array.isArray(value?.logs) ? value.logs.map(String).slice(-80) : [],
     goal: normalizeAgentGoal(value?.goal, DEFAULT_AGENT_GOAL),
+    metricRules: normalizeAgentMetricRules(value?.metricRules),
     usage: {
       collectedWorks: Math.max(0, Number(usage.collectedWorks || 0)),
       aiCalls: Math.max(0, Number(usage.aiCalls || 0)),
@@ -128,6 +130,7 @@ function serializeRun(run: any) {
     campaignTaskId: run.campaignTaskId,
     status: run.status,
     startStage: run.startStage,
+    agentDeviceId: run.agentDeviceId || undefined,
     worker: {
       workerId: run.workerId || undefined,
       lastHeartbeatAt: run.lastHeartbeatAt?.toISOString?.(),
@@ -198,6 +201,7 @@ function serializeRun(run: any) {
         maxNoGrowthRounds: run.maxNoGrowthRounds,
         maxRounds: run.maxRounds
       }),
+      metricRules: normalizeAgentMetricRules(run.metricRules),
       usage: {
         collectedWorks: run.collectedWorks,
         aiCalls: run.aiCalls,
@@ -237,19 +241,25 @@ export async function POST(request: NextRequest) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "DATABASE_URL 未配置。" }, { status: 503 });
   }
-  const body = (await request.json().catch(() => null)) as { campaignTaskId?: number; state?: unknown; enqueue?: boolean; startStage?: string } | null;
+  const body = (await request.json().catch(() => null)) as { campaignTaskId?: number; state?: unknown; enqueue?: boolean; startStage?: string; agentDeviceId?: string } | null;
   const campaignTaskId = Number(body?.campaignTaskId || 0);
   if (!Number.isInteger(campaignTaskId) || campaignTaskId <= 0) {
     return NextResponse.json({ error: "无效的品类任务。" }, { status: 400 });
   }
   const snapshot = cleanSnapshot(body?.state);
   const enqueue = body?.enqueue === true;
+  const agentDeviceId = String(body?.agentDeviceId || "").trim() || null;
   const startStage = ["crawling", "discovering", "profiling", "reviewing"].includes(String(body?.startStage))
     ? String(body?.startStage)
     : "crawling";
   // prisma singleton from import
   try {
     if (enqueue) {
+      if (process.env.LOCAL_AGENT_MODE === "queue") {
+        if (!agentDeviceId) return NextResponse.json({ error: "请先启动并选择本机达人采集助手。" }, { status: 400 });
+        const online = await prisma.localAgentDevice.findFirst({ where: { id: agentDeviceId, lastSeenAt: { gte: new Date(Date.now() - 45_000) } } });
+        if (!online) return NextResponse.json({ error: "所选达人采集助手已离线，请重新启动 EXE。" }, { status: 409 });
+      }
       const active = await prisma.agentRun.findFirst({
         where: { campaignTaskId, status: { in: ["queued", "running", "paused", "stopping"] } },
         include: { steps: true, rounds: { orderBy: { roundNumber: "asc" }, include: { feedbacks: { orderBy: { createdAt: "asc" } } } } },
@@ -270,6 +280,7 @@ export async function POST(request: NextRequest) {
           status: enqueue ? "queued" : runStatus(snapshot),
           stage: enqueue ? "idle" : snapshot.stage,
           startStage,
+          agentDeviceId,
           failedStage: snapshot.failedStage || null,
           message: enqueue ? "任务已进入后台队列，等待 Worker 领取。" : snapshot.message,
           completed: snapshot.completed,
@@ -283,6 +294,7 @@ export async function POST(request: NextRequest) {
           maxDurationMinutes: snapshot.goal.maxDurationMinutes,
           maxNoGrowthRounds: snapshot.goal.maxNoGrowthRounds,
           maxRounds: snapshot.goal.maxRounds,
+          metricRules: snapshot.metricRules || undefined,
           collectedWorks: snapshot.usage.collectedWorks,
           aiCalls: snapshot.usage.aiCalls,
           currentRound: snapshot.usage.currentRound,
@@ -365,7 +377,6 @@ export async function PATCH(request: NextRequest) {
           stopReason: null,
           startedAt: null,
           finishedAt: null,
-          ...(retryStage === "profiling" ? { aiCalls: 0 } : {}),
           ...(retryStage === "crawling" ? { collectedWorks: 0 } : {})
         };
         await prisma.agentRunStep.updateMany({
@@ -405,6 +416,7 @@ export async function PATCH(request: NextRequest) {
           maxDurationMinutes: snapshot.goal.maxDurationMinutes,
           maxNoGrowthRounds: snapshot.goal.maxNoGrowthRounds,
           maxRounds: snapshot.goal.maxRounds,
+          metricRules: snapshot.metricRules || undefined,
           collectedWorks: snapshot.usage.collectedWorks,
           aiCalls: snapshot.usage.aiCalls,
           currentRound: snapshot.usage.currentRound,

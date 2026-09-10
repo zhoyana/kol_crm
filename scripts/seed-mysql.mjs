@@ -46,6 +46,11 @@ function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function normalizeOutreachStatus(value) {
+  const status = String(value || "").trim();
+  return ["已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃", "发送中"].includes(status) ? "已建联" : "未建联";
+}
+
 async function main() {
   const filePath = path.join(process.cwd(), "data", "creators.csv");
   const csv = await readFile(filePath, "utf8");
@@ -67,7 +72,7 @@ async function main() {
         fans: numberValue(record["粉丝数"]),
         plays,
         quote: numberValue(record["报价"]) || null,
-        outreachStatus: record["建联状态"] || "未建联",
+        outreachStatus: normalizeOutreachStatus(record["建联状态"]),
         cooperationStatus: record["确定合作"] || null,
         contact: record["微信联系方式"] || null,
         notes: record["沟通记录"] || record["备注"] || null
@@ -80,7 +85,7 @@ async function main() {
         fans: numberValue(record["粉丝数"]),
         plays,
         quote: numberValue(record["报价"]) || null,
-        outreachStatus: record["建联状态"] || "未建联",
+        outreachStatus: normalizeOutreachStatus(record["建联状态"]),
         cooperationStatus: record["确定合作"] || null,
         contact: record["微信联系方式"] || null,
         notes: record["沟通记录"] || record["备注"] || null

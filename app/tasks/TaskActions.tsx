@@ -88,7 +88,8 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
       body: JSON.stringify({
         outreachStatus,
         action,
-        content
+        content,
+        campaignTaskId: campaignTaskId || null
       })
     });
 
@@ -116,17 +117,7 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
 
     window.open(profileUrl, "_blank", "noopener,noreferrer");
 
-    const updated = await updateStatus(
-      "待发送确认",
-      "open_contact",
-      copied
-        ? `已为 ${creatorName} 复制建联话术，并打开达人主页/沟通页，等待人工发送确认。\n\n话术：${draftScript}`
-        : `已打开 ${creatorName} 的达人主页/沟通页，但浏览器没有允许自动复制话术。`
-    );
-
-    if (updated) {
-      setMessage(copied ? "话术已复制，已打开达人主页。发送后记得点“标记已发送”。" : "已打开达人主页，但话术复制失败，请手动复制。");
-    }
+    setMessage(copied ? "话术已复制，已打开达人主页。发送后记得点“标记已发送”。" : "已打开达人主页，但话术复制失败，请手动复制。");
   }
 
   async function markSent() {
@@ -160,8 +151,8 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
     try {
       const response = await fetch("/api/outreach/send", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ creatorId, profileUrl, message: draftScript, taskKind })
+        headers: { "Content-Type": "application/json", "x-kol-agent-id": window.localStorage.getItem("kol-crm-local-agent-id") || "" },
+        body: JSON.stringify({ creatorId, profileUrl, message: draftScript, taskKind, campaignTaskId: campaignTaskId || null })
       });
       const result = (await response.json().catch(() => ({}))) as { ok?: boolean; message?: string; error?: string };
       if (!response.ok || !result.ok) {
@@ -178,12 +169,6 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
     } finally {
       setIsSending(false);
     }
-  }
-
-  async function markFollowup() {
-    setMessage("");
-    const updated = await updateStatus("需跟进", "mark_followup", `将 ${creatorName} 标记为后续跟进。`);
-    if (updated) setMessage("已加入跟进。");
   }
 
   return (
@@ -213,9 +198,6 @@ export function TaskActions({ creatorId, creatorName, profileUrl, script, taskKi
         </button>
         <button className="secondary-button" disabled={isPending} onClick={markSent} type="button">
           标记已发送
-        </button>
-        <button className="secondary-button" disabled={isPending} onClick={markFollowup} type="button">
-          稍后跟进
         </button>
       </div>
       {message ? <p className="task-message">{message}</p> : null}

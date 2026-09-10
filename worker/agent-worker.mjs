@@ -8,10 +8,11 @@ const appBaseUrl = (process.env.APP_BASE_URL || "http://127.0.0.1:3000").replace
 const pollMs = Math.max(1000, Number(process.env.AGENT_WORKER_POLL_MS || 2000));
 const leaseMs = Math.max(30000, Number(process.env.AGENT_WORKER_LEASE_MS || 60000));
 const heartbeatMs = Math.min(leaseMs / 2, Math.max(5000, Number(process.env.AGENT_WORKER_HEARTBEAT_MS || 15000)));
+const homepageBacklogLimit = Math.min(30, Math.max(5, Number(process.env.AGENT_HOMEPAGE_BACKLOG_LIMIT || 15)));
+const newCandidateLimit = Math.min(50, Math.max(5, Number(process.env.AGENT_NEW_CANDIDATE_LIMIT || 20)));
 const stages = ["crawling", "discovering", "importing", "profiling", "reviewing", "outreach_ready"];
 let shuttingDown = false;
-let nextInboxSyncAt = 0;
-const inboxSyncIntervalMs = Math.max(5 * 60_000, Number(process.env.OUTREACH_INBOX_SYNC_INTERVAL_MS || 10 * 60_000));
+let activeAgentDeviceId = "";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const iso = () => new Date().toISOString();
@@ -21,30 +22,47 @@ class StopRun extends Error {
 }
 
 async function requestJson(path, init) {
-  const response = await fetch(`${appBaseUrl}${path}`, init);
+  const headers = { ...(init?.headers || {}) };
+  if (activeAgentDeviceId) headers["x-kol-agent-id"] = activeAgentDeviceId;
+  const response = await fetch(`${appBaseUrl}${path}`, { ...init, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `${path} 请求失败（${response.status}）`);
   return data;
 }
 
-async function requestJsonWithTransientRetry(path, init, attempts = 2) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await requestJson(path, init);
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      const transient = /Page\.goto:\s*Timeout|connect_over_cdp|CDP.*(?:失败|断开|timeout)|browser connection.*(?:disconnected|closed|failed)|ECONNRESET|ETIMEDOUT|fetch failed/i.test(message);
-      if (!transient || attempt >= attempts) throw error;
-      await appendLog(Number(JSON.parse(String(init?.body || "{}")).agentRunId || 0), `临时浏览器故障，准备重试画像批次（${attempt + 1}/${attempts}）。`).catch(() => {});
-      await sleep(2500 * attempt);
-    }
-  }
-  throw lastError;
-}
-
 async function claimNextRun() {
+  // Worker 在收到取消请求后异常退出时，任务可能永久停在 stopping。
+  // 新 Worker 轮询时先收口已过租约的停止中任务，避免页面一直显示“正在停止”。
+  const staleStopping = await prisma.agentRun.findFirst({
+    where: {
+      status: "stopping",
+      OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: new Date() } }]
+    },
+    select: { id: true }
+  });
+  if (staleStopping) {
+    const now = new Date();
+    await prisma.$transaction([
+      prisma.agentRun.update({
+        where: { id: staleStopping.id },
+        data: {
+          status: "stopped", stage: "stopped", stopReason: "cancelled",
+          message: "Agent 已停止。", finishedAt: now,
+          workerId: null, lockedAt: null, leaseExpiresAt: null, lastHeartbeatAt: null,
+          version: { increment: 1 }
+        }
+      }),
+      prisma.agentRunStep.updateMany({
+        where: { agentRunId: staleStopping.id, status: "running" },
+        data: { status: "stopped", finishedAt: now, detail: "Agent 已停止" }
+      }),
+      prisma.agentRunRound.updateMany({
+        where: { agentRunId: staleStopping.id, status: "running" },
+        data: { status: "stopped", stopReason: "cancelled", finishedAt: now }
+      })
+    ]);
+  }
+
   const candidate = await prisma.agentRun.findFirst({
     where: {
       OR: [
@@ -164,6 +182,24 @@ async function loadQueueIds(campaignTaskId, stage) {
     console.log(`[agent-worker] 复筛队列：API=${data.creators.length}，待晋升=${ids.length}`);
     return ids;
   }
+  if (stage === "profiling" && Array.isArray(data.creators)) {
+    // Manual rechecks are targeted repair requests. Process them before the
+    // passive backlog so the requested creators are not displaced by older
+    // unrelated pending profiles.
+    return [...data.creators]
+      // Legacy teaching-mode imports only contain an irreversible creator hash.
+      // They cannot be homepage-profiled and must not consume every new run's
+      // inventory budget ahead of newly collected, addressable creators.
+      .filter((creator) =>
+        String(creator.profileUrl || "").includes("/user/") ||
+        !String(creator.externalId || "").startsWith("douyin-")
+      )
+      .sort((left, right) =>
+        Number(right.screeningStatus === "manual_recheck") - Number(left.screeningStatus === "manual_recheck")
+      )
+      .map((creator) => String(creator.externalId || creator.id || ""))
+      .filter(Boolean);
+  }
   return Array.isArray(data.ids) ? data.ids.map(String).filter(Boolean) : [];
 }
 
@@ -172,6 +208,7 @@ function termsFromText(value) {
 }
 
 async function runAgent(run) {
+  activeAgentDeviceId = String(run.agentDeviceId || "");
   const task = run.campaignTask;
   const startedAt = run.startedAt || new Date();
   let startIndex = Math.max(0, stages.indexOf(run.startStage || "crawling"));
@@ -184,13 +221,53 @@ async function runAgent(run) {
   let aiCalls = Number(run.aiCalls || 0);
   let collectedWorks = Number(run.collectedWorks || 0);
   let featuredAdded = Number(run.featuredAdded || 0);
+  let forcedKeyword = "";
+  let inventoryPreflightPending = startIndex === 0 && currentRound === 1 && featuredAdded === 0;
+  let inventoryFirstRound = false;
   const { resolveDiscoveryRuleTemplate } = await import("../lib/discovery-rule-templates.ts");
   const metricTemplate = resolveDiscoveryRuleTemplate(task).metricRules;
+  const metricOverride = run.metricRules?.useCustom ? run.metricRules : null;
+  const baseMetricRules = metricOverride ? {
+    requireAvgLikes: Boolean(metricOverride.requireAvgLikes),
+    avgLikesThreshold: Number(metricOverride.avgLikesThreshold),
+    requireViralWorks: Boolean(metricOverride.requireViralWorks),
+    viralLikesThreshold: Number(metricOverride.viralLikesThreshold),
+    minViralWorks: Number(metricOverride.minViralWorks),
+    requireSampleWorks: Boolean(metricOverride.requireSampleWorks),
+    minSampleWorks: Number(metricOverride.minSampleWorks),
+    requireRecentUpdate: Boolean(metricOverride.requireRecentUpdate),
+    matchMode: metricOverride.matchMode === "all" ? "all" : "any"
+  } : metricTemplate;
+  const isXhsTask = /小红书|xhs/i.test(String(task.platform || ""));
+  const activeMetricRules = isXhsTask
+    ? {
+        ...baseMetricRules,
+        avgLikesThreshold: Math.min(100, Number(baseMetricRules.avgLikesThreshold || 100)),
+        viralLikesThreshold: Math.min(500, Number(baseMetricRules.viralLikesThreshold || 500))
+      }
+    : baseMetricRules;
 
   const timer = setInterval(() => void heartbeat(run.id).catch(() => {}), heartbeatMs);
   try {
     while (true) {
-    const roundKeyword = keywords[(currentRound - 1) % keywords.length];
+    if (inventoryPreflightPending) {
+      inventoryPreflightPending = false;
+      const pendingPortraitIds = await loadQueueIds(task.id, "profiling");
+      const pendingMetricIds = await loadQueueIds(task.id, "reviewing");
+      if (pendingPortraitIds.length) {
+        startIndex = 3;
+        inventoryFirstRound = true;
+        await appendLog(run.id, `库存优先：发现待画像 ${pendingPortraitIds.length} 人、画像已通过待筛选 ${pendingMetricIds.length} 人，首轮跳过新采集。`);
+      } else if (pendingMetricIds.length) {
+        startIndex = 4;
+        inventoryFirstRound = true;
+        await appendLog(run.id, `库存优先：发现画像已通过待筛选 ${pendingMetricIds.length} 人，首轮直接执行数据门槛。`);
+      } else {
+        await appendLog(run.id, "库存优先检查完成：当前没有待画像或待筛选达人，开始关键词采集。");
+      }
+    }
+    const roundKeyword = forcedKeyword || keywords[(currentRound - 1) % keywords.length];
+    forcedKeyword = "";
     const roundStartedAt = new Date();
     const roundAiCallsAtStart = aiCalls;
     const collectedWorksAtStart = collectedWorks;
@@ -199,6 +276,7 @@ async function runAgent(run) {
     let roundPortraitInsufficient = 0;
     let roundPortraitIncomplete = 0;
     let roundPortraitRejected = 0;
+    let crawlTaskId = "";
     candidates = [];
     importedIds = startIndex >= 2 ? importedIds : [];
     currentPortraitPassedIds = [];
@@ -212,18 +290,32 @@ async function runAgent(run) {
     if (startIndex <= 0) {
       await controlPoint(run.id, startedAt, run.maxDurationMinutes);
       await enterStep(run.id, "crawling", "正在启动关键词采集…", 1);
-      await requestJson("/api/crawler/douyin/start", {
+      const platformKey = /小红书|xhs/i.test(String(task.platform || "")) ? "xhs" : "douyin";
+      // maxCollectedWorks is the per-keyword collection limit shown in the UI,
+      // not a cumulative run budget. The run-level safety limits remain AI,
+      // duration, max rounds, and the target count.
+      const remainingCollectionBudget = Math.max(1, Number(run.maxCollectedWorks || 1));
+      const startedCrawler = await requestJson(`/api/crawler/${platformKey}/start`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          keyword: roundKeyword, maxNotes: Math.min(300, run.maxCollectedWorks), discoveryMode: "single",
-          restartCdpBeforeSpawn: true,
+          keyword: roundKeyword,
+          // XHS is deliberately collected in small batches. The run-level
+          // budget can still be 100+, but each original keyword only keeps the
+          // signed-in browser active for about 25 notes before profiling work
+          // creates a natural cooling-off period.
+          maxNotes: platformKey === "xhs"
+            ? Math.min(25, remainingCollectionBudget)
+            : Math.min(300, remainingCollectionBudget),
+          discoveryMode: "single",
+          restartCdpBeforeSpawn: platformKey !== "xhs",
           topicLimit: 3, publishWindowDays: 180, sortBy: "relevance",
           topicRules: { primaryTerms: task.seedKeywords, supportTerms: task.productSellingPoints, excludeTerms: task.excludeKeywords }
         })
       });
+      crawlTaskId = String(startedCrawler?.id || "");
       while (true) {
         await controlPoint(run.id, startedAt, run.maxDurationMinutes);
-        const crawler = await requestJson("/api/crawler/douyin/status");
+        const crawler = await requestJson(`/api/crawler/${platformKey}/status`);
         collectedWorks = collectedWorksAtStart + Number(crawler.collectedWorks || 0);
         const detail = Array.isArray(crawler.logs) && crawler.logs.length ? String(crawler.logs.at(-1)) : `采集状态：${crawler.status}`;
         await progress(run.id, "crawling", crawler.status === "succeeded" ? 1 : 0, 1, detail,
@@ -239,22 +331,37 @@ async function runAgent(run) {
     if (startIndex <= 1) {
       await controlPoint(run.id, startedAt, run.maxDurationMinutes);
       await enterStep(run.id, "discovering", "正在从采集结果聚合候选达人…", 1);
-      const discovered = await requestJson("/api/discover/douyin", {
+      const platformKey = /小红书|xhs/i.test(String(task.platform || "")) ? "xhs" : "douyin";
+      const discovered = await requestJson(`/api/discover/${platformKey}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          keyword: roundKeyword, campaignTaskId: task.id,
+          keyword: roundKeyword,
+          crawlTaskId: platformKey === "xhs" ? crawlTaskId : undefined,
+          campaignTaskId: task.id,
           filters: { publishWindowDays: 180, sortBy: "relevance", primaryTerms: [...task.seedKeywords, ...termsFromText(task.targetAudience), ...termsFromText(task.targetDescription)], supportTerms: task.productSellingPoints, excludeTerms: task.excludeKeywords, useAiWorkFilter: true }
         })
       });
       candidates = Array.isArray(discovered.candidates) ? discovered.candidates : [];
+      if (candidates.length > newCandidateLimit) {
+        const discoveredTotal = candidates.length;
+        candidates = candidates.slice(0, newCandidateLimit);
+        await appendLog(
+          run.id,
+          `本轮聚合出 ${discoveredTotal} 位新候选，按优先顺序仅让前 ${candidates.length} 人进入导入与主页画像，其余候选留待后续轮次。`
+        );
+      }
       if (!candidates.length) {
         const rawCandidateCount = Number(discovered.stats?.rawCandidateCount || 0);
         const hiddenExistingCount = Number(discovered.stats?.hiddenExistingCount || 0);
-        const emptyDetail = rawCandidateCount > 0 && hiddenExistingCount >= rawCandidateCount
+        const intentFilteredCount = Number(discovered.stats?.intentFilteredCount || 0);
+        const emptyDetail = intentFilteredCount > 0
+          ? `聚合出 ${rawCandidateCount} 位作者，但 ${intentFilteredCount} 位均未通过达人身份画像门槛；本轮新增候选 0 人。`
+          : rawCandidateCount > 0 && hiddenExistingCount >= rawCandidateCount
           ? `聚合出 ${rawCandidateCount} 位达人，但均已存在于达人库；本轮新增候选 0 人。`
           : `达人聚合完成，本轮没有符合条件的新候选。`;
         await finishStep(run.id, "discovering", emptyDetail, 1, 1, [
           { label: "聚合达人", value: rawCandidateCount, tone: "neutral" },
+          { label: "画像身份排除", value: intentFilteredCount, tone: intentFilteredCount ? "danger" : "neutral" },
           { label: "历史达人", value: hiddenExistingCount, tone: "neutral" },
           { label: "新增候选", value: 0, tone: "warning" }
         ]);
@@ -266,10 +373,14 @@ async function runAgent(run) {
         }
         noGrowthRounds += 1;
         const roundLimitReached = currentRound >= run.maxRounds;
-        const noGrowthReached = noGrowthRounds >= run.maxNoGrowthRounds;
-        const stopReason = roundLimitReached ? "max_rounds_reached" : noGrowthReached ? "no_growth_limit_reached" : null;
+        const noGrowthReached = noGrowthRounds >= run.maxNoGrowthRounds
+          && currentRound >= Math.min(run.maxRounds, keywords.length);
+        const collectionLimitReached = false;
+        const stopReason = collectionLimitReached ? "collection_budget_reached" : roundLimitReached ? "max_rounds_reached" : noGrowthReached ? "no_growth_limit_reached" : null;
         const decision = stopReason
-          ? roundLimitReached
+          ? collectionLimitReached
+            ? `已达到采集作品上限 ${run.maxCollectedWorks}，本轮结束。`
+            : roundLimitReached
             ? `已完成最大 ${run.maxRounds} 轮，本轮无新增候选。`
             : `连续 ${noGrowthRounds} 轮没有新增精选，已按停止条件结束。`
           : `本轮没有新候选，自动切换下一个关键词继续。`;
@@ -316,7 +427,8 @@ async function runAgent(run) {
       await controlPoint(run.id, startedAt, run.maxDurationMinutes);
       if (!candidates.length) throw new Error("没有可导入候选，请从达人聚合步骤重试。");
       await enterStep(run.id, "importing", "正在建立主页样本与画像队列…", candidates.length);
-      const imported = await requestJson("/api/discover/douyin/import", {
+      const platformKey = /小红书|xhs/i.test(String(task.platform || "")) ? "xhs" : "douyin";
+      const imported = await requestJson(`/api/discover/${platformKey}/import`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ candidates, campaignTaskId: task.id })
       });
@@ -330,6 +442,14 @@ async function runAgent(run) {
     }
 
     let profileIds = startIndex === 3 ? await loadQueueIds(task.id, "profiling") : importedIds;
+    if (startIndex === 3 && profileIds.length > homepageBacklogLimit) {
+      const backlogTotal = profileIds.length;
+      profileIds = profileIds.slice(0, homepageBacklogLimit);
+      await appendLog(
+        run.id,
+        `历史主页补齐队列共 ${backlogTotal} 人，本轮限量处理 ${profileIds.length} 人，剩余 ${backlogTotal - profileIds.length} 人留待后续运行。`
+      );
+    }
     if (startIndex <= 3) {
       if (!profileIds.length) throw new Error("当前品类没有等待补齐主页样本或 AI 画像的达人。");
       await enterStep(run.id, "profiling", "正在补齐主页样本并执行 AI 作品画像初筛…", profileIds.length);
@@ -342,9 +462,18 @@ async function runAgent(run) {
         const safeBatchSize = allowFullRetry ? Math.max(1, Math.min(5, Math.floor(remaining / 2))) : 1;
         const batch = profileIds.slice(index, index + safeBatchSize);
         await patchRun(run.id, { message: `正在补齐主页样本：${completed}/${profileIds.length}` });
-        const profiled = await requestJsonWithTransientRetry("/api/review/douyin/batch", {
+        const portraitPlatform = /小红书|xhs/i.test(String(task.platform || "")) ? "xhs" : "douyin";
+        const profiled = await requestJson(`/api/review/${portraitPlatform}/batch`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "portrait", ids: batch, campaignTaskId: task.id, agentRunId: run.id, workLimit: 10, allowFullRetry, skipObviousMismatch: true })
+          body: JSON.stringify({
+            mode: "portrait",
+            ids: batch,
+            campaignTaskId: task.id,
+            agentRunId: run.id,
+            workLimit: Math.min(12, Math.max(10, Number(process.env.AGENT_HOMEPAGE_WORK_LIMIT || 12))),
+            allowFullRetry,
+            skipObviousMismatch: true
+          })
         });
         const resultRows = Array.isArray(profiled.results) ? profiled.results : [];
         const actualAiCalls = Math.max(0, Number(profiled.aiCalls ?? resultRows.reduce((sum, item) => sum + Number(item.aiCalls || 0), 0)));
@@ -380,7 +509,7 @@ async function runAgent(run) {
       roundPortraitRejected = rejected;
     }
 
-    const usesHistoricalReviewQueue = startIndex >= 4;
+    const usesHistoricalReviewQueue = startIndex >= 4 || inventoryFirstRound;
     const metricIds = usesHistoricalReviewQueue ? await loadQueueIds(task.id, "reviewing") : currentPortraitPassedIds;
     await enterStep(run.id, "reviewing", "正在读取已记录指标并应用数据门槛…", metricIds.length);
     let completed = 0, succeeded = 0, failed = 0, featured = 0, rejected = 0, pending = 0;
@@ -390,11 +519,11 @@ async function runAgent(run) {
       const reviewed = await requestJson("/api/review/douyin/batch", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: batch, campaignTaskId: task.id, mode: "metrics", rules: {
-          requireAvgLikes500: metricTemplate.requireAvgLikes, avgLikesThreshold: metricTemplate.avgLikesThreshold,
-          requireViral2000: metricTemplate.requireViralWorks, viralLikesThreshold: metricTemplate.viralLikesThreshold,
-          minViralWorks: metricTemplate.minViralWorks, requireWorkCount10: metricTemplate.requireSampleWorks,
-          minSampleWorks: metricTemplate.minSampleWorks, metricMatchMode: metricTemplate.matchMode,
-          requireRecentViral: false, requireRecentUpdate: metricTemplate.requireRecentUpdate
+          requireAvgLikes500: activeMetricRules.requireAvgLikes, avgLikesThreshold: activeMetricRules.avgLikesThreshold,
+          requireViral2000: activeMetricRules.requireViralWorks, viralLikesThreshold: activeMetricRules.viralLikesThreshold,
+          minViralWorks: activeMetricRules.minViralWorks, requireWorkCount10: activeMetricRules.requireSampleWorks,
+          minSampleWorks: activeMetricRules.minSampleWorks, metricMatchMode: activeMetricRules.matchMode,
+          requireRecentViral: false, requireRecentUpdate: activeMetricRules.requireRecentUpdate
         } })
       });
       const resultRows = Array.isArray(reviewed.results) ? reviewed.results : [];
@@ -419,18 +548,27 @@ async function runAgent(run) {
     await controlPoint(run.id, startedAt, run.maxDurationMinutes);
     await enterStep(run.id, "outreach_ready", "正在生成建联队列…", 1);
     await finishStep(run.id, "outreach_ready", "建联队列已生成", 1, 1, [{ label: "待建联达人", value: featured, tone: "success" }]);
+    const maintenanceCycle = inventoryFirstRound;
     featuredAdded += featured;
-    noGrowthRounds = featured === 0 ? noGrowthRounds + 1 : 0;
+    if (!maintenanceCycle) noGrowthRounds = featured === 0 ? noGrowthRounds + 1 : 0;
     const targetReached = featuredAdded >= run.targetFeaturedCount;
-    const roundLimitReached = currentRound >= run.maxRounds;
-    const noGrowthReached = noGrowthRounds >= run.maxNoGrowthRounds;
-    const stopReason = targetReached ? "target_reached" : roundLimitReached ? "max_rounds_reached" : noGrowthReached ? "no_growth_limit_reached" : null;
-    const decision = stopReason
+    const roundLimitReached = !maintenanceCycle && currentRound >= run.maxRounds;
+    const noGrowthReached = !maintenanceCycle
+      && noGrowthRounds >= run.maxNoGrowthRounds
+      && currentRound >= Math.min(run.maxRounds, keywords.length);
+    const collectionLimitReached = false;
+    let stopReason = targetReached ? "target_reached" : collectionLimitReached ? "collection_budget_reached" : roundLimitReached ? "max_rounds_reached" : noGrowthReached ? "no_growth_limit_reached" : null;
+    let decision = maintenanceCycle && !targetReached
+      ? `库存维护完成，本次不计入业务轮次或连续无增长次数；继续执行第 ${currentRound} 轮关键词采集。`
+      : collectionLimitReached
+      ? `已达到采集作品上限 ${run.maxCollectedWorks}，本轮结束。`
+      : stopReason
       ? targetReached ? `累计新增精选 ${featuredAdded} 人，达到目标。` : roundLimitReached ? `已完成最多 ${run.maxRounds} 轮。` : `连续 ${noGrowthRounds} 轮没有新增精选。`
       : `目标尚缺 ${Math.max(0, run.targetFeaturedCount - featuredAdded)} 人，切换下一个关键词继续。`;
     let strategyData = { strategyStatus: "skipped", strategyError: null };
+    let resolvedStrategy = null;
     try {
-      const { generateAgentStrategy } = await import("../lib/agent-strategy.ts");
+      const { generateAgentStrategy, resolveAgentStrategyExecution } = await import("../lib/agent-strategy.ts");
       const strategyInput = {
         brandName: task.brandLibrary?.name || "",
         campaignTaskName: task.name,
@@ -465,8 +603,9 @@ async function runAgent(run) {
         deterministicDecision: decision,
         deterministicStopReason: stopReason
       };
-      await appendLog(run.id, `正在生成第 ${currentRound} 轮策略建议（仅展示，不执行）…`);
+      await appendLog(run.id, `观察完成：正在基于本轮证据选择唯一下一步动作…`);
       const strategy = await generateAgentStrategy(strategyInput);
+      resolvedStrategy = resolveAgentStrategyExecution(strategy.decision, strategyInput);
       strategyData = {
         strategyStatus: "completed",
         strategyModel: strategy.model,
@@ -482,7 +621,24 @@ async function runAgent(run) {
         strategyOutput: strategy.raw,
         strategyError: null
       };
-      await appendLog(run.id, `策略建议：${strategy.decision.human_message}（仅展示，不执行）`);
+      await appendLog(run.id, `决策：${strategy.decision.action}；${resolvedStrategy.reason}`);
+      if (resolvedStrategy.executable) {
+        if (resolvedStrategy.mode === "stop") {
+          stopReason = stopReason || `agent_${strategy.decision.action}`;
+          decision = `Agent 验证后停止：${resolvedStrategy.reason}`;
+        } else if (resolvedStrategy.mode === "retry") {
+          decision = `Agent 将重试当前关键词：${resolvedStrategy.reason}`;
+        } else if (resolvedStrategy.mode === "supplement") {
+          decision = `Agent 下一轮先补采信息不足达人：${resolvedStrategy.reason}`;
+        } else {
+          decision = `Agent 将继续下一个关键词：${resolvedStrategy.reason}`;
+        }
+        await appendLog(run.id, `执行授权通过：${resolvedStrategy.mode}；将在本轮持久化后执行。`);
+      } else {
+        stopReason = "human_review_required";
+        decision = `Agent 已暂停并请求人工复核：${resolvedStrategy.reason}`;
+        await appendLog(run.id, `验证未通过自动执行门槛：${resolvedStrategy.reason}`);
+      }
     } catch (strategyError) {
       const strategyMessage = strategyError instanceof Error ? strategyError.message : "策略模型调用失败";
       strategyData = { strategyStatus: "failed", strategyError: strategyMessage };
@@ -505,8 +661,10 @@ async function runAgent(run) {
       });
       break;
     }
-    currentRound += 1;
-    startIndex = 0;
+    if (!maintenanceCycle) currentRound += 1;
+    if (resolvedStrategy?.mode === "retry") forcedKeyword = roundKeyword;
+    startIndex = resolvedStrategy?.mode === "supplement" ? 3 : 0;
+    inventoryFirstRound = false;
     await prisma.agentRunStep.updateMany({
       where: { agentRunId: run.id },
       data: { status: "waiting", completed: 0, total: 0, detail: `等待第 ${currentRound} 轮`, results: [], startedAt: null, finishedAt: null }
@@ -525,6 +683,7 @@ async function runAgent(run) {
       await patchRun(run.id, { status: "failed", stage: "failed", failedStage: stages.includes((await prisma.agentRun.findUnique({ where: { id: run.id }, select: { stage: true } }))?.stage) ? (await prisma.agentRun.findUnique({ where: { id: run.id }, select: { stage: true } })).stage : run.startStage, error: message, message: "执行失败，可以重新排队重试。", finishedAt: new Date(), workerId: null, leaseExpiresAt: null });
     }
   } finally {
+    activeAgentDeviceId = "";
     clearInterval(timer);
   }
 }
@@ -541,16 +700,6 @@ async function main() {
       const run = await claimNextRun();
       if (run) await runAgent(run);
       else {
-        if (Date.now() >= nextInboxSyncAt && String(process.env.OUTREACH_INBOX_MONITOR_ENABLED || "true").toLowerCase() !== "false") {
-          nextInboxSyncAt = Date.now() + inboxSyncIntervalMs;
-          try {
-            const { syncOutreachInbox } = await import("../lib/outreach-inbox.ts");
-            const result = await syncOutreachInbox();
-            console.log(`[agent-worker] 回复监控：${result.message}`);
-          } catch (error) {
-            console.warn("[agent-worker] 回复监控失败：", error instanceof Error ? error.message : error);
-          }
-        }
         await sleep(pollMs);
       }
     } catch (error) {

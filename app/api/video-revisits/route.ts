@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { fetchDouyinVideoDetail } from "@/lib/video-revisit";
+import { agentIdFromRequest } from "@/lib/central-agent-auth";
+import { withLocalAgentDevice } from "@/lib/local-agent-client";
 
 export const runtime = "nodejs";
 export const maxDuration = 180;
@@ -16,6 +18,10 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  return withLocalAgentDevice(agentIdFromRequest(request), () => handlePost(request));
+}
+
+async function handlePost(request: Request) {
   try {
     const body = await request.json() as { videoUrl?: string; category?: string; campaignTaskId?: number | string | null };
     const videoUrl = String(body.videoUrl || "").trim();
@@ -42,7 +48,8 @@ export async function POST(request: Request) {
     });
     await prisma.videoRevisitRecord.create({
       data: {
-        targetId: target.id, likeCount: detail.likeCount, commentCount: detail.commentCount,
+        targetId: target.id, likeCount: detail.likeCount, collectCount: detail.collectCount,
+        commentCount: detail.commentCount,
         rawJson: detail.rawJson as Prisma.InputJsonValue
       }
     });

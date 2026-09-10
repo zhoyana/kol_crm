@@ -1,10 +1,13 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { randomUUID } from "node:crypto";
 
 const LOCK_STALE_MS = 2 * 60 * 1000;
 const LOCK_POLL_MS = 2_000;
 const LOCK_WAIT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const LOCK_PERMISSION_RETRY_MS = 500;
+const LOCK_PERMISSION_RETRIES = 10;
 
 type LockOwner = {
   token: string;
@@ -22,12 +25,13 @@ export type CdpTaskLease = {
   release: () => Promise<void>;
 };
 
-function crawlerRoot(): string {
-  return path.resolve(process.cwd(), "..", "MediaCrawler-main");
-}
-
 function lockDir(): string {
-  return path.join(crawlerRoot(), ".kol-crm-cdp.lock");
+  // Keep the runtime mutex out of the MediaCrawler source tree. On Windows the
+  // Documents/Codex parent can intermittently reject mkdir with EPERM (security
+  // scanning / controlled-folder rules), even though crawler output remains
+  // writable. The OS temp directory is designed for short-lived runtime locks
+  // and is shared by both Next.js and the Agent worker for this user session.
+  return process.env.KOL_CRM_CDP_LOCK_DIR || path.join(os.tmpdir(), "kol-crm-cdp.lock");
 }
 
 function ownerFile(): string {
@@ -97,6 +101,7 @@ export async function acquireCdpTaskLock(input: {
   const startedAt = Date.now();
   const timeoutMs = input.timeoutMs ?? LOCK_WAIT_TIMEOUT_MS;
   const token = randomUUID();
+  let permissionRetries = 0;
 
   while (true) {
     try {
@@ -104,7 +109,16 @@ export async function acquireCdpTaskLock(input: {
       break;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
+      // Windows can briefly return EPERM/EACCES while Chrome, Defender, or a
+      // previous lock cleanup still has a directory handle open. Retrying here
+      // prevents a transient filesystem race from failing the whole Agent run.
+      if ((code === "EPERM" || code === "EACCES") && permissionRetries < LOCK_PERMISSION_RETRIES) {
+        permissionRetries += 1;
+        await wait(LOCK_PERMISSION_RETRY_MS);
+        continue;
+      }
       if (code !== "EEXIST") throw error;
+      permissionRetries = 0;
       await reclaimStaleLock();
       const owner = await readOwner();
       input.onWait?.(owner);

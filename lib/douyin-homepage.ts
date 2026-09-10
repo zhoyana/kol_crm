@@ -1,8 +1,3 @@
-import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
-import path from "node:path";
-import { ensureCdpBrowser, isCdpBrowserAvailable, restartCdpBrowser } from "./cdp-browser";
-import { acquireCdpTaskLock } from "./cdp-task-lock";
 import {
   parseDouyinDiscoveryCandidates,
   toImportCandidate,
@@ -11,14 +6,21 @@ import {
   type DouyinWork
 } from "./douyin-import";
 import { resolveDiscoveryRuleTemplate } from "./discovery-rule-templates";
+import {
+  readAgentCachedHomepageRows,
+  readAgentRecentHomepageRow,
+  readAgentRecentHomepageRows,
+  runAgentHomepageCrawl
+} from "./douyin-homepage-agent";
 
 const ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 const THREE_MONTH_MS = 90 * 24 * 60 * 60 * 1000;
 const VIRAL_LIKES = 2000;
-const MIN_AVG_LIKES = 500;
-const HOMEPAGE_WORK_LIMIT = 10;
+// The Douyin featured gate requires at least 10 valid homepage works. Fetch a
+// small buffer so one unavailable/private work does not make every otherwise
+// qualified creator fail the sample-count check.
+const HOMEPAGE_WORK_LIMIT = 12;
 const LIGHT_HOMEPAGE_WORK_LIMIT = 6;
-const HOMEPAGE_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 
 export type HomepageReviewRules = {
   requireAvgLikes500?: boolean;
@@ -60,8 +62,8 @@ type HomepageBooleanRuleKey =
   | "requireRecentUpdate";
 
 type HomepageResult =
-  | { ok: true; candidate: DouyinCandidate; aiCalls?: number }
-  | { ok: false; reason: string; aiCalls?: number };
+  | { ok: true; candidate: DouyinCandidate; fans?: number; aiCalls?: number }
+  | { ok: false; reason: string; fans?: number; aiCalls?: number };
 
 export type HomepageBatchReviewResult = {
   externalId: string;
@@ -77,14 +79,6 @@ type HomepageAiDecision = {
   negativeSignals: string[];
 };
 
-function mediaCrawlerRoot(): string {
-  return path.join(process.cwd(), "..", "MediaCrawler-main");
-}
-
-function douyinJsonlDir(): string {
-  return path.join(mediaCrawlerRoot(), "data", "douyin", "jsonl");
-}
-
 function secUidFromCandidate(candidate: DouyinDiscoveryCandidate): string {
   if (candidate.secUid) return candidate.secUid;
   if (candidate.profileUrl?.includes("/user/")) {
@@ -92,226 +86,6 @@ function secUidFromCandidate(candidate: DouyinDiscoveryCandidate): string {
   }
   if (candidate.creatorId?.startsWith("MS4w")) return candidate.creatorId;
   return "";
-}
-
-function isCdpTakeoverFailure(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /connect_over_cdp|无法接管已登录的CDP浏览器|Unable to take control of the logged-in CDP browser|CRAWLER_ZERO_CREATOR_WORKS|Page\.goto:\s*Timeout|navigating to "https:\/\/www\.douyin\.com\/"|ArgusSecurityPlugin|DataFetchError/i.test(message);
-}
-
-async function runMediaCrawlerCreators(secUids: string[], workLimit = HOMEPAGE_WORK_LIMIT): Promise<void> {
-  const uvCommand = process.env.CRAWLER_UV_COMMAND || "uv";
-  const crawlerEnvironment = Object.fromEntries(
-    Object.entries(process.env).filter(
-      ([key]) => key !== "VIRTUAL_ENV" && key.toLowerCase() !== "path"
-    )
-  );
-  const crawlerPath = process.env.CRAWLER_PATH || process.env.PATH || process.env.Path || "";
-  const args = [
-    "run",
-    "main.py",
-    "--platform",
-    "dy",
-    "--lt",
-    "qrcode",
-    "--type",
-    "creator",
-    "--creator_id",
-    secUids.join(","),
-    "--crawler_max_notes_count",
-    String(workLimit),
-    "--max_concurrency_num",
-    "1",
-    "--get_comment",
-    "false",
-    "--get_sub_comment",
-    "false",
-    "--save_data_option",
-    "jsonl"
-  ];
-
-  let activePid: number | null = null;
-  const runOnce = () => new Promise<void>((resolve, reject) => {
-    const timeoutMs = Math.max(30_000, Number(process.env.CRAWLER_CREATOR_TIMEOUT_MS || 90_000));
-    const child = spawn(uvCommand, args, {
-      cwd: mediaCrawlerRoot(),
-      windowsHide: true,
-      shell: false,
-      env: {
-        ...crawlerEnvironment,
-        PATH: crawlerPath,
-        PYTHONIOENCODING: "utf-8",
-        KOL_CREATOR_CONCURRENCY: "1"
-      } as unknown as NodeJS.ProcessEnv
-    });
-    activePid = child.pid ?? null;
-    let stderr = "";
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      callback();
-    };
-    const timeout = setTimeout(() => {
-      child.kill();
-      finish(() => reject(new Error(`MediaCrawler 主页采集超时（${Math.round(timeoutMs / 1000)} 秒）`)));
-    }, timeoutMs);
-
-    child.stdout.on("data", () => undefined);
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", (error) => finish(() => reject(error)));
-    child.on("close", (code) => {
-      finish(() => {
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `MediaCrawler exited with code ${code}`));
-      });
-    });
-  });
-
-  const lease = await acquireCdpTaskLock({
-    taskType: "homepage_portrait",
-    taskId: `portrait-${Date.now()}-${secUids[0] || "unknown"}`,
-    detail: `${secUids.length} 位达人`,
-    onWait: (owner) => {
-      console.info(
-        `[cdp-lock] 主页画像等待采集资源；当前占用：${owner?.taskType || "未知任务"} ${owner?.detail || ""}`
-      );
-    }
-  });
-  try {
-    await ensureCdpBrowser();
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      try {
-        const running = runOnce();
-        await lease.setPid(activePid);
-        await running;
-        break;
-      } catch (error) {
-        if (attempt >= maxAttempts) throw error;
-        if (isCdpTakeoverFailure(error)) {
-          console.warn(`[homepage-crawler] CDP 接管或抖音导航临时失败，正在重启专用 Chrome 并重试当前批次（${attempt + 1}/${maxAttempts}）。`);
-          await restartCdpBrowser();
-        } else {
-          if (await isCdpBrowserAvailable()) throw error;
-          await ensureCdpBrowser();
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
-      }
-    }
-  } finally {
-    await lease.release();
-  }
-}
-
-function runMediaCrawlerCreator(secUid: string, workLimit = HOMEPAGE_WORK_LIMIT): Promise<void> {
-  return runMediaCrawlerCreators([secUid], workLimit);
-}
-
-async function listContentFiles(): Promise<string[]> {
-  try {
-    const names = await readdir(douyinJsonlDir());
-    const files = await Promise.all(
-      names
-        .filter((name) => name.endsWith(".jsonl") && name.includes("contents"))
-        .map(async (name) => {
-          const filePath = path.join(douyinJsonlDir(), name);
-          const fileStat = await stat(filePath);
-          return { filePath, mtimeMs: fileStat.mtimeMs };
-        })
-    );
-    return files.sort((a, b) => b.mtimeMs - a.mtimeMs).map((file) => file.filePath);
-  } catch {
-    return [];
-  }
-}
-
-async function readRecentCreatorRows(secUid: string, startedAt: number): Promise<string> {
-  const files = await listContentFiles();
-  const rows: string[] = [];
-  const lowerSecUid = secUid.toLowerCase();
-
-  for (const filePath of files) {
-    const content = await readFile(filePath, "utf8");
-    for (const line of content.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      try {
-        const item = JSON.parse(line) as Record<string, unknown>;
-        const lastModifyTs = Number(item.last_modify_ts || 0);
-        const itemSecUid = String(item.creator_sec_uid || "").toLowerCase();
-        if (lastModifyTs >= startedAt - 10_000 && (!itemSecUid || itemSecUid === lowerSecUid)) {
-          rows.push(line);
-        }
-      } catch {
-        // Ignore broken rows from partially written jsonl files.
-      }
-    }
-  }
-
-  return rows.join("\n");
-}
-
-async function readRecentCreatorRowsBySecUid(secUids: string[], startedAt: number): Promise<Map<string, string>> {
-  const files = await listContentFiles();
-  const rowsBySecUid = new Map(secUids.map((secUid) => [secUid.toLowerCase(), [] as string[]]));
-  const secUidSet = new Set(secUids.map((secUid) => secUid.toLowerCase()));
-
-  for (const filePath of files) {
-    const content = await readFile(filePath, "utf8");
-    for (const line of content.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      try {
-        const item = JSON.parse(line) as Record<string, unknown>;
-        const lastModifyTs = Number(item.last_modify_ts || 0);
-        if (lastModifyTs < startedAt - 10_000) continue;
-
-        const itemSecUid = String(item.creator_sec_uid || "").toLowerCase();
-        if (!itemSecUid || !secUidSet.has(itemSecUid)) continue;
-        rowsBySecUid.get(itemSecUid)?.push(line);
-      } catch {
-        // Ignore broken rows from partially written jsonl files.
-      }
-    }
-  }
-
-  return new Map(Array.from(rowsBySecUid.entries()).map(([secUid, rows]) => [secUid, rows.join("\n")]));
-}
-
-async function readCachedCreatorRowsBySecUid(secUids: string[], minWorks: number): Promise<Map<string, string>> {
-  const files = (await listContentFiles()).filter((filePath) => path.basename(filePath).includes("creator_contents"));
-  const rowsBySecUid = new Map(secUids.map((secUid) => [secUid.toLowerCase(), new Map<string, string>()]));
-  const secUidSet = new Set(secUids.map((secUid) => secUid.toLowerCase()));
-  const cacheCutoff = Date.now() - HOMEPAGE_CACHE_TTL_MS;
-
-  for (const filePath of files) {
-    const content = await readFile(filePath, "utf8");
-    for (const line of content.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      try {
-        const item = JSON.parse(line) as Record<string, unknown>;
-        const lastModifyTs = Number(item.last_modify_ts || 0);
-        if (lastModifyTs < cacheCutoff) continue;
-
-        const itemSecUid = String(item.creator_sec_uid || "").toLowerCase();
-        const awemeId = String(item.aweme_id || "");
-        if (!itemSecUid || !awemeId || !secUidSet.has(itemSecUid)) continue;
-        const rows = rowsBySecUid.get(itemSecUid);
-        if (rows && !rows.has(awemeId)) rows.set(awemeId, line);
-      } catch {
-        // Ignore broken rows from partially written jsonl files.
-      }
-    }
-  }
-
-  return new Map(
-    Array.from(rowsBySecUid.entries())
-      .filter(([, rows]) => rows.size >= minWorks)
-      .map(([secUid, rows]) => [secUid, Array.from(rows.values()).join("\n")])
-  );
 }
 
 function isRecentWork(work: DouyinWork): boolean {
@@ -345,19 +119,6 @@ function safeJsonObject(text: string): Record<string, unknown> {
   } catch {
     return {};
   }
-}
-
-function taskText(task?: HomepageReviewRules["campaignTask"]): string {
-  if (!task) return "";
-  return [
-    task.name,
-    task.productName,
-    task.category || "",
-    task.targetAudience,
-    task.targetDescription,
-    ...(task.seedKeywords || []),
-    ...(task.productSellingPoints || [])
-  ].filter(Boolean).join(" ");
 }
 
 function splitTaskTerms(values: string[]): string[] {
@@ -521,11 +282,21 @@ async function requestHomepageAiDecision(input: {
   hasRecentUpdate: boolean;
   campaignTask?: HomepageReviewRules["campaignTask"];
 }): Promise<{ decision: HomepageAiDecision | null; aiCalls: number }> {
-  const apiKey = process.env.OPENAI_API_KEY;
+  // Homepage portraits are a high-volume workflow. Use the configured
+  // DeepSeek account first; the legacy OpenAI relay currently has no quota and
+  // silently turned every otherwise-complete portrait into "信息不足".
+  const useDeepSeek = Boolean(process.env.DEEPSEEK_API_KEY);
+  const apiKey = useDeepSeek ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY;
   if (!apiKey || !input.recentWorks.length) return { decision: null, aiCalls: 0 };
 
-  const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const baseUrl = (
+    useDeepSeek
+      ? process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com"
+      : process.env.OPENAI_BASE_URL || "https://api.openai.com/v1"
+  ).replace(/\/$/, "");
+  const model = useDeepSeek
+    ? process.env.DEEPSEEK_MODEL || "deepseek-chat"
+    : process.env.OPENAI_MODEL || "gpt-4o-mini";
   let response: Response;
   try {
     response = await fetch(`${baseUrl}/chat/completions`, {
@@ -537,6 +308,7 @@ async function requestHomepageAiDecision(input: {
       body: JSON.stringify({
         model,
         temperature: 0.1,
+        ...(useDeepSeek ? { thinking: { type: "disabled" } } : {}),
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: "你只输出可解析 JSON。" },
@@ -806,7 +578,7 @@ function medicalHomepageHardRejectReason(
   }
   if (
     works.length >= 8 &&
-    vlogCount >= Math.ceil(works.length * 0.6)
+    vlogCount >= Math.ceil(works.length * 0.8)
   ) {
     return `最近 ${works.length} 条中有 ${vlogCount} 条为 Vlog/生活记录，内容结构过度单一，不符合医护小熊精选要求。`;
   }
@@ -985,6 +757,12 @@ function nonFeaturedReason(original: DouyinDiscoveryCandidate, works: DouyinWork
 
   const templateReason = templateFeaturedBlockReason(works, campaignTask);
   if (templateReason) return templateReason;
+
+  // 医护模板已经在 medicalFeaturedBlockReason 中用更明确的 Vlog/
+  // 生活记录词和 80% 阈值检查“主页几乎全是 Vlog”。不要再套用下面
+  // 包含“日常、记录、一天”等宽泛词的通用规则，否则真实医护日常也
+  // 会被当作流水账误排除。
+  if (template.id === "medical-bear") return null;
 
   const vlogTerms = [
     "vlog",
@@ -1238,6 +1016,7 @@ async function withHomepageDecision(
   workLimit = HOMEPAGE_WORK_LIMIT
 ): Promise<HomepageResult> {
   const recentWorks = homepage.works.slice(0, workLimit);
+  const refreshedFans = Math.max(Number(original.fans || 0), Number(homepage.fans || 0));
   const hardHomepageAccountTypes = [
     "official",
     "brand",
@@ -1260,11 +1039,11 @@ async function withHomepageDecision(
   ) {
     const reason = original.rejectReason || homepage.rejectReason
       || (original.fans >= 100_000 || homepage.fans >= 100_000 ? "粉丝数达到或超过10万，命中大V硬排除" : "账号类型命中机构、媒体、认证号或营销培训硬排除");
-    return { ok: false, reason: `${original.name || homepage.name}：${reason}`, aiCalls: 0 };
+    return { ok: false, reason: `${original.name || homepage.name}：${reason}`, fans: refreshedFans, aiCalls: 0 };
   }
   const hasRecentUpdate = recentWorks.some(isRecentWork);
   const hasActiveUpdate = recentWorks.some(isActiveWork);
-  if (!hasActiveUpdate) return { ok: false, reason: `${original.name || homepage.name}：最近3个月没有有效更新`, aiCalls: 0 };
+  if (!hasActiveUpdate) return { ok: false, reason: `${original.name || homepage.name}：最近3个月没有有效更新`, fans: refreshedFans, aiCalls: 0 };
 
   const avgLikes = recentWorks.length
     ? Math.round(recentWorks.reduce((sum, work) => sum + work.likeCount, 0) / recentWorks.length)
@@ -1278,10 +1057,10 @@ async function withHomepageDecision(
   const isMedicalBear = discoveryTemplate.id === "medical-bear";
   const medicalHardRejectReason = isMedicalBear ? medicalHomepageHardRejectReason(original, homepage, recentWorks) : null;
   if (medicalHardRejectReason) {
-    return { ok: false, reason: `${original.name || homepage.name}：医护画像硬排除——${medicalHardRejectReason}`, aiCalls: 0 };
+    return { ok: false, reason: `${original.name || homepage.name}：医护画像硬排除——${medicalHardRejectReason}`, fans: refreshedFans, aiCalls: 0 };
   }
   const aiResult = await requestHomepageAiDecision({
-    original,
+    original: { ...original, fans: refreshedFans },
     recentWorks,
     avgLikes,
     maxLikes,
@@ -1293,12 +1072,28 @@ async function withHomepageDecision(
 
   const keepReason = candidateKeepReason(original, recentWorks, rules?.campaignTask);
   if (aiDecision?.decision === "reject") {
-    return { ok: false, reason: `${original.name || homepage.name}：AI画像排除——${aiDecision.reason}`, aiCalls: aiResult.aiCalls };
+    return { ok: false, reason: `${original.name || homepage.name}：AI画像排除——${aiDecision.reason}`, fans: refreshedFans, aiCalls: aiResult.aiCalls };
   }
   const portraitConcern = nonFeaturedReason(original, recentWorks, rules?.campaignTask);
-  const portraitPassed = aiDecision?.decision === "pass" && !portraitConcern;
-  const poolStatus = portraitPassed ? "candidate" : "pending_review";
-  const screeningStatus = portraitPassed ? "portrait_passed" : "portrait_insufficient";
+  // "maybe" is intentionally conservative. When the deterministic template
+  // has all required evidence and AI also found a positive target-identity
+  // signal, it is safe to advance to the metric gate instead of repeatedly
+  // crawling the same complete homepage sample.
+  const aiSupported =
+    aiDecision?.decision === "pass" ||
+    (aiDecision?.decision === "maybe" && Boolean(keepReason));
+  // AI 明确判定画像 pass 时先进入待选库，数据是否足够由下一阶段的
+  // 数据门槛决定。portraitConcern 属于软提示，只约束 maybe；纯科普、
+  // 机构号、无关账号、近乎全 Vlog 等硬排除已在前面直接返回 rejected。
+  const portraitPassed = aiDecision?.decision === "pass" || (aiSupported && !portraitConcern);
+  const hasCompleteRuleSample = recentWorks.length >= discoveryTemplate.homepageReview.minSamplesForFeatured;
+  const portraitRejectedByRules = aiDecision?.decision !== "pass" && Boolean(portraitConcern) && hasCompleteRuleSample;
+  const poolStatus = portraitPassed ? "candidate" : portraitRejectedByRules ? "rejected" : "pending_review";
+  const screeningStatus = portraitPassed
+    ? "portrait_passed"
+    : portraitRejectedByRules
+      ? "portrait_rejected"
+      : "portrait_insufficient";
   const sortedLikes = recentWorks.map((work) => work.likeCount).sort((a, b) => a - b);
   const medianLikes = sortedLikes.length
     ? sortedLikes.length % 2
@@ -1311,7 +1106,11 @@ async function withHomepageDecision(
     aiDecision ? `AI作品画像：${aiDecision.decision}，${aiDecision.reason}` : "AI作品画像：接口未启用或未返回结果，标记为信息不足",
     aiDecision?.decision === "maybe" && keepReason ? `存在目标身份线索，但 AI 证据不足：${keepReason}` : "",
     portraitConcern ? `规则提示：${portraitConcern}` : "",
-    portraitPassed ? "画像符合，进入待选库" : "画像证据不足，等待补采或人工确认",
+    portraitPassed
+      ? "画像符合，进入待选库"
+      : portraitRejectedByRules
+        ? "主页样本已完整但不符合画像规则，予以排除"
+        : "画像证据不足，等待补采或人工确认",
     hasViralWork ? "出现点赞超过2000的作品" : "未发现点赞超过2000的作品",
     `主页样本平均点赞 ${avgLikes}，中位点赞 ${medianLikes}，最高点赞 ${maxLikes}`,
     hasRecentViralWork ? "近1个月出现爆款" : "近1个月未发现爆款",
@@ -1320,9 +1119,11 @@ async function withHomepageDecision(
 
   return {
     ok: true,
+    fans: refreshedFans,
     aiCalls: aiResult.aiCalls,
     candidate: {
       ...toImportCandidate(homepage),
+    fans: refreshedFans,
     name: original.name || homepage.name,
     profileUrl: original.profileUrl || homepage.profileUrl,
     category: original.category || homepage.category,
@@ -1348,10 +1149,11 @@ export function applyHomepageMetricRules(
   rules?: HomepageReviewRules
 ): DouyinCandidate {
   const works = candidate.works || [];
-  const avgLikesThreshold = Math.max(0, Number(rules?.avgLikesThreshold ?? 500));
-  const viralLikesThreshold = Math.max(0, Number(rules?.viralLikesThreshold ?? 2000));
+  const isDouyin = candidate.platform === "抖音";
+  const avgLikesThreshold = Math.max(isDouyin ? 500 : 0, Number(rules?.avgLikesThreshold ?? 500));
+  const viralLikesThreshold = Math.max(isDouyin ? 2000 : 0, Number(rules?.viralLikesThreshold ?? 2000));
   const minViralWorks = Math.max(1, Number(rules?.minViralWorks ?? 1));
-  const minSampleWorks = Math.max(1, Number(rules?.minSampleWorks ?? 10));
+  const minSampleWorks = Math.max(isDouyin ? 10 : 1, Number(rules?.minSampleWorks ?? 10));
   const viralWorks = works.filter((work) => work.likeCount > viralLikesThreshold);
   const recentViralWorks = viralWorks.filter(isRecentWork);
   const recentWorks = works.filter(isRecentWork);
@@ -1384,8 +1186,8 @@ export function applyHomepageMetricRules(
     };
   }
 
-  const requiresAvgLikes = isRuleEnabled(rules, "requireAvgLikes500", true);
-  const requiresViralWork = isRuleEnabled(rules, "requireViral2000", true);
+  const requiresAvgLikes = isDouyin || isRuleEnabled(rules, "requireAvgLikes500", true);
+  const requiresViralWork = isDouyin || isRuleEnabled(rules, "requireViral2000", true);
   const engagementChecks = [
     ...(requiresAvgLikes ? [candidate.avgLikes > avgLikesThreshold] : []),
     ...(requiresViralWork ? [viralWorks.length >= minViralWorks] : [])
@@ -1395,13 +1197,16 @@ export function applyHomepageMetricRules(
     : rules?.metricMatchMode === "any"
       ? engagementChecks.some(Boolean)
       : engagementChecks.every(Boolean);
+  const metricsDisabled = engagementChecks.length === 0;
+  const requireSampleWorks = isDouyin || isRuleEnabled(rules, "requireWorkCount10", false);
+  const requireRecentUpdate = isDouyin || isRuleEnabled(rules, "requireRecentUpdate", false);
   const checks = [
     engagementMatched,
-    !isRuleEnabled(rules, "requireWorkCount10", false) || works.length >= minSampleWorks,
+    !requireSampleWorks || works.length >= minSampleWorks,
     !isRuleEnabled(rules, "requireRecentViral", false) || recentViralWorks.length >= minViralWorks,
-    !isRuleEnabled(rules, "requireRecentUpdate", false) || recentWorks.length > 0
+    !requireRecentUpdate || recentWorks.length > 0
   ];
-  const matched = checks.every(Boolean);
+  const matched = !metricsDisabled && checks.every(Boolean);
   const screeningStatus = matched
     ? recentViralWorks.length
       ? "featured_trending"
@@ -1412,9 +1217,9 @@ export function applyHomepageMetricRules(
   const ruleSummary = [
     requiresAvgLikes ? `平均点赞 > ${avgLikesThreshold}：${candidate.avgLikes > avgLikesThreshold ? "通过" : "未通过"}` : "",
     requiresViralWork ? `点赞 > ${viralLikesThreshold} 的作品至少 ${minViralWorks} 条：${viralWorks.length >= minViralWorks ? "通过" : "未通过"}` : "",
-    isRuleEnabled(rules, "requireWorkCount10", false) ? `主页样本至少 ${minSampleWorks} 条：${works.length >= minSampleWorks ? "通过" : "未通过"}` : "",
+    requireSampleWorks ? `主页样本至少 ${minSampleWorks} 条：${works.length >= minSampleWorks ? "通过" : "未通过"}` : "",
     isRuleEnabled(rules, "requireRecentViral", false) ? `近1个月爆款：${recentViralWorks.length ? "通过" : "未通过"}` : "",
-    isRuleEnabled(rules, "requireRecentUpdate", false) ? `近1个月更新：${recentWorks.length ? "通过" : "未通过"}` : ""
+    requireRecentUpdate ? `近1个月更新：${recentWorks.length ? "通过" : "未通过"}` : ""
   ].filter(Boolean);
 
   return {
@@ -1423,7 +1228,7 @@ export function applyHomepageMetricRules(
     screeningStatus,
     screeningSummary: [
       candidate.screeningSummary || "",
-      ruleSummary.length ? `数据门槛：${ruleSummary.join("；")}` : "未启用数据门槛，画像通过后直接进入精选",
+      ruleSummary.length ? `数据门槛：${ruleSummary.join("；")}` : "未启用有效数据门槛，不允许进入精选库",
       matched ? "数据门槛通过，进入精选库" : "数据门槛未完全通过，留在待选库"
     ].filter(Boolean).join("；")
   };
@@ -1440,7 +1245,7 @@ export async function verifyDouyinHomepageCandidate(
 
   const startedAt = Date.now();
   try {
-    await runMediaCrawlerCreator(secUid);
+    await runAgentHomepageCrawl([secUid], HOMEPAGE_WORK_LIMIT);
   } catch (error) {
     return {
       ok: false,
@@ -1448,7 +1253,7 @@ export async function verifyDouyinHomepageCandidate(
     };
   }
 
-  const content = await readRecentCreatorRows(secUid, startedAt);
+  const content = await readAgentRecentHomepageRow(secUid, startedAt);
   const homepageCandidates = parseDouyinDiscoveryCandidates(content, candidate.category || "未分类", {
     requireRecentQualified: false,
     includeRejected: true
@@ -1475,7 +1280,7 @@ async function verifyDouyinHomepageCandidateWithLimit(
 
   const startedAt = Date.now();
   try {
-    await runMediaCrawlerCreator(secUid, workLimit);
+    await runAgentHomepageCrawl([secUid], workLimit);
   } catch (error) {
     return {
       ok: false,
@@ -1483,7 +1288,7 @@ async function verifyDouyinHomepageCandidateWithLimit(
     };
   }
 
-  const content = await readRecentCreatorRows(secUid, startedAt);
+  const content = await readAgentRecentHomepageRow(secUid, startedAt);
   const homepageCandidates = parseDouyinDiscoveryCandidates(content, candidate.category || "未分类", {
     requireRecentQualified: false,
     includeRejected: true
@@ -1561,10 +1366,47 @@ export async function verifyDouyinHomepageCandidatesBatch(
   const crawlItems = prepared.filter((item) => item.secUid && !item.skipReason);
   if (!crawlItems.length) return immediateResults;
 
+  async function reviewFromDiscoverySample(
+    item: (typeof crawlItems)[number],
+    failureReason: string,
+    limit: number
+  ): Promise<HomepageBatchReviewResult> {
+    if (!item.candidate.works.length) {
+      return {
+        externalId: item.candidate.externalId,
+        result: { ok: false as const, reason: `${item.candidate.name} ${failureReason}；关键词阶段也没有可用作品样本` }
+      };
+    }
+
+    const fallback = await withHomepageDecision(item.candidate, item.candidate, rules, limit);
+    const caveat = `主页接口受限，降级使用关键词阶段已有的 ${Math.min(item.candidate.works.length, limit)} 条作品；结果为低样本判断`;
+    if (!fallback.ok) {
+      return {
+        externalId: item.candidate.externalId,
+        result: { ...fallback, reason: `${fallback.reason}；${caveat}` }
+      };
+    }
+    const screeningSummary = String(fallback.candidate.screeningSummary || "")
+      .replace(/^主页样本已补齐：/, `${caveat}：`);
+    return {
+      externalId: item.candidate.externalId,
+      result: {
+        ...fallback,
+        candidate: {
+          ...fallback.candidate,
+          screeningSummary,
+          notes: `${fallback.candidate.notes || ""}\n\n${caveat}`.trim()
+        }
+      }
+    };
+  }
+
   const template = resolveDiscoveryRuleTemplate(rules?.campaignTask);
-  const minCachedWorks = Math.max(6, template.homepageReview.minSamplesForFeatured);
+  // Samples below the hard Douyin metric gate are not reusable as a complete
+  // cache hit. Re-crawl them so legacy 6/8-work portraits can reach 10 works.
+  const minCachedWorks = Math.max(10, template.homepageReview.minSamplesForFeatured);
   const allSecUids = Array.from(new Set(crawlItems.map((item) => item.secUid)));
-  const cachedRowsBySecUid = await readCachedCreatorRowsBySecUid(allSecUids, minCachedWorks);
+  const cachedRowsBySecUid = await readAgentCachedHomepageRows(allSecUids, minCachedWorks);
   const cachedItems = crawlItems.filter((item) => cachedRowsBySecUid.has(item.secUid.toLowerCase()));
   const uncachedItems = crawlItems.filter((item) => !cachedRowsBySecUid.has(item.secUid.toLowerCase()));
 
@@ -1575,7 +1417,7 @@ export async function verifyDouyinHomepageCandidatesBatch(
     providedRows?: Map<string, string>
   ): Promise<HomepageBatchReviewResult[]> {
     const retrySecUids = Array.from(new Set(items.map((item) => item.secUid)));
-    const retryRowsBySecUid = providedRows || await readRecentCreatorRowsBySecUid(retrySecUids, rowsStartedAt);
+    const retryRowsBySecUid = providedRows || await readAgentRecentHomepageRows(retrySecUids, rowsStartedAt);
 
     return Promise.all(items.map(async (item) => {
       try {
@@ -1588,10 +1430,7 @@ export async function verifyDouyinHomepageCandidatesBatch(
           homepageCandidates.find((candidate) => candidate.secUid === item.secUid || candidate.creatorId === item.secUid) || homepageCandidates[0];
 
         if (!homepageCandidate?.works.length) {
-          return {
-            externalId: item.candidate.externalId,
-            result: { ok: false as const, reason: `${item.candidate.name} 未读取到主页作品，跳过` }
-          };
+          return reviewFromDiscoverySample(item, "未读取到主页作品", limit);
         }
 
         const verified = await withHomepageDecision(item.candidate, homepageCandidate, rules, limit);
@@ -1619,7 +1458,7 @@ export async function verifyDouyinHomepageCandidatesBatch(
     const startedAt = Date.now();
     const secUids = Array.from(new Set(uncachedItems.map((item) => item.secUid)));
     try {
-      await runMediaCrawlerCreators(secUids, workLimit);
+      await runAgentHomepageCrawl(secUids, workLimit);
       freshlyReviewed = await reviewItems(uncachedItems, workLimit, startedAt);
       const unreadableCount = freshlyReviewed.filter(
         (item) => !item.result.ok && /未读取到主页作品/.test(item.result.reason)
@@ -1633,28 +1472,20 @@ export async function verifyDouyinHomepageCandidatesBatch(
       }
     } catch (error) {
       const batchMessage = error instanceof Error ? error.message : "未知错误";
-      console.warn(`[homepage-review] 批量主页采集失败，降级为逐人采集：${batchMessage}`);
-      const fallbackResults: HomepageBatchReviewResult[] = [];
-      for (const item of uncachedItems) {
-        const itemStartedAt = Date.now();
-        try {
-          await runMediaCrawlerCreators([item.secUid], workLimit);
-          fallbackResults.push(...await reviewItems([item], workLimit, itemStartedAt));
-        } catch (itemError) {
-          const itemMessage = itemError instanceof Error ? itemError.message : "未知错误";
-          fallbackResults.push({
-            externalId: item.candidate.externalId,
-            result: { ok: false, reason: `${item.candidate.name} 主页采集失败：${itemMessage}` }
-          });
-        }
-      }
-      freshlyReviewed = fallbackResults;
+      console.warn(`[homepage-review] 批量主页采集失败，改用关键词阶段已有作品做低样本画像：${batchMessage}`);
+      freshlyReviewed = await Promise.all(
+        uncachedItems.map((item) => reviewFromDiscoverySample(item, `主页采集失败：${batchMessage}`, workLimit))
+      );
     }
   }
   const reviewed = [...cachedReviewed, ...freshlyReviewed];
 
+  // A cached homepage sample can still be too small or too weak to support a
+  // portrait decision. Those creators must be freshly crawled as well; limiting
+  // retries to uncachedItems would incorrectly leave them in "待补采" without
+  // ever opening the dedicated CDP Chrome.
   const retryItems = options.allowFullRetry && workLimit < HOMEPAGE_WORK_LIMIT
-    ? uncachedItems.filter((item) => {
+    ? crawlItems.filter((item) => {
         const result = reviewed.find((review) => review.externalId === item.candidate.externalId)?.result;
         if (!result) return false;
         if (!result.ok) return true;
@@ -1665,7 +1496,7 @@ export async function verifyDouyinHomepageCandidatesBatch(
   if (retryItems.length) {
     const retryStartedAt = Date.now();
     try {
-      await runMediaCrawlerCreators(Array.from(new Set(retryItems.map((item) => item.secUid))), HOMEPAGE_WORK_LIMIT);
+      await runAgentHomepageCrawl(Array.from(new Set(retryItems.map((item) => item.secUid))), HOMEPAGE_WORK_LIMIT, 1);
       const retryReviewed = await reviewItems(retryItems, HOMEPAGE_WORK_LIMIT, retryStartedAt);
       const retryMap = new Map(retryReviewed.map((item) => [item.externalId, item]));
       return [...immediateResults, ...reviewed.map((item) => {

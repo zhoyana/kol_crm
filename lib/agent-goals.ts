@@ -7,6 +7,39 @@ export type AgentGoal = {
   maxRounds: number;
 };
 
+export type AgentMetricRules = {
+  useCustom: boolean;
+  requireAvgLikes: boolean;
+  avgLikesThreshold: number;
+  requireViralWorks: boolean;
+  viralLikesThreshold: number;
+  minViralWorks: number;
+  requireSampleWorks: boolean;
+  minSampleWorks: number;
+  requireRecentUpdate: boolean;
+  matchMode: "any" | "all";
+};
+
+export function normalizeAgentMetricRules(value: any): AgentMetricRules | null {
+  if (!value?.useCustom) return null;
+  const integer = (input: unknown, fallback: number, min = 0, max = 10_000_000) => {
+    const parsed = Math.round(Number(input));
+    return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+  };
+  return {
+    useCustom: true,
+    requireAvgLikes: Boolean(value.requireAvgLikes),
+    avgLikesThreshold: integer(value.avgLikesThreshold, 500),
+    requireViralWorks: Boolean(value.requireViralWorks),
+    viralLikesThreshold: integer(value.viralLikesThreshold, 2000),
+    minViralWorks: integer(value.minViralWorks, 1, 1, 100),
+    requireSampleWorks: Boolean(value.requireSampleWorks),
+    minSampleWorks: integer(value.minSampleWorks, 10, 1, 100),
+    requireRecentUpdate: Boolean(value.requireRecentUpdate),
+    matchMode: value.matchMode === "all" ? "all" : "any"
+  };
+}
+
 export const DEFAULT_AGENT_GOAL: AgentGoal = {
   targetFeaturedCount: 20,
   maxCollectedWorks: 50,

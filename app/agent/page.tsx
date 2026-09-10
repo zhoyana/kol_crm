@@ -13,7 +13,7 @@ export default async function AgentPage() {
         <header className="topbar">
           <div>
             <h1>Agent 工作台</h1>
-            <p>选择任务，一键完成发现、画像、数据筛选与建联准备。</p>
+            <p>选择任务，完成观察、决策、执行与验证，并用固定基准集持续评测。</p>
           </div>
         </header>
 

@@ -61,6 +61,42 @@ export type AgentStrategyDecision = {
   human_message: string;
 };
 
+export type AgentExecutionResolution = {
+  mode: "continue" | "retry" | "supplement" | "stop" | "human_review";
+  executable: boolean;
+  reason: string;
+};
+
+/**
+ * Final runtime gate between probabilistic model output and deterministic side effects.
+ * The model may recommend any allow-listed strategy, but only low-risk transitions
+ * can execute without a person. Keyword/rule edits always become review requests.
+ */
+export function resolveAgentStrategyExecution(
+  decision: AgentStrategyDecision,
+  context: Pick<AgentStrategyContext, "deterministicStopReason">
+): AgentExecutionResolution {
+  if (context.deterministicStopReason) {
+    return { mode: "stop", executable: true, reason: `程序硬停止：${context.deterministicStopReason}` };
+  }
+  if (decision.confidence < 0.72) {
+    return { mode: "human_review", executable: false, reason: `策略置信度 ${Math.round(decision.confidence * 100)}%，低于自动执行阈值 72%` };
+  }
+  if (["optimize_keywords", "review_rules", "request_human_review"].includes(decision.action)) {
+    return { mode: "human_review", executable: false, reason: "动作会改变任务规则或明确要求人工判断" };
+  }
+  if (["stop_target_reached", "stop_budget_reached", "stop_low_yield"].includes(decision.action)) {
+    return { mode: "stop", executable: true, reason: decision.human_message };
+  }
+  if (decision.action === "retry_current_keyword") {
+    return { mode: "retry", executable: true, reason: decision.human_message };
+  }
+  if (decision.action === "supplement_incomplete") {
+    return { mode: "supplement", executable: true, reason: decision.human_message };
+  }
+  return { mode: "continue", executable: true, reason: decision.human_message };
+}
+
 const SYSTEM_PROMPT = `你是达人筛选策略 Agent。你只分析每轮结果并生成建议，不执行动作，也不能修改数据库、关键词或筛选规则。
 
 必须区分：技术执行是否健康、采集策略是否有效、达人画像是否符合。流程成功不等于策略有效，技术失败也不能算作画像排除。
@@ -68,7 +104,7 @@ const SYSTEM_PROMPT = `你是达人筛选策略 Agent。你只分析每轮结果
 
 允许动作：${AGENT_STRATEGY_ACTIONS.join(", ")}。
 达到程序硬停止条件时，只能建议 stop_target_reached 或 stop_budget_reached；不得要求继续。
-第一版建议仅展示给人工，程序不会执行你的动作。
+程序会在独立运行时守卫检查后自动执行低风险动作；修改关键词、修改规则和低置信度决定必须转人工。你不能绕过守卫或要求扩大权限。
 只返回符合给定 JSON Schema 的 JSON，不要输出 Markdown。`;
 
 const strategySchema = {
@@ -111,8 +147,15 @@ function parseJsonContent(content: string): unknown {
 function validateDecision(value: any): AgentStrategyDecision {
   if (!value || typeof value !== "object") throw new Error("策略模型没有返回对象");
   if (!AGENT_STRATEGY_ACTIONS.includes(value.action)) throw new Error(`策略动作不在允许列表：${String(value.action)}`);
-  const confidence = Math.max(0, Math.min(1, Number(value.confidence)));
-  if (!Number.isFinite(confidence)) throw new Error("策略置信度无效");
+  const rawConfidence = typeof value.confidence === "string"
+    ? Number(value.confidence.replace("%", "").trim())
+    : Number(value.confidence);
+  const normalizedConfidence = Number.isFinite(rawConfidence)
+    ? rawConfidence > 1 && rawConfidence <= 100
+      ? rawConfidence / 100
+      : rawConfidence
+    : 0.5;
+  const confidence = Math.max(0, Math.min(1, normalizedConfidence));
   const technical = ["healthy", "degraded", "failed"].includes(value.technical_status) ? value.technical_status : "degraded";
   const strategy = ["effective", "uncertain", "low_yield", "blocked"].includes(value.strategy_status) ? value.strategy_status : "uncertain";
   return {

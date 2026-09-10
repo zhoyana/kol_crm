@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CampaignTaskItem } from "@/lib/campaign-tasks";
-import { normalizeAgentGoal, type AgentGoal } from "@/lib/agent-goals";
+import { normalizeAgentGoal, normalizeAgentMetricRules, type AgentGoal, type AgentMetricRules } from "@/lib/agent-goals";
 import { resolveDiscoveryRuleTemplate } from "@/lib/discovery-rule-templates";
 
 type WorkStage = "crawling" | "discovering" | "importing" | "profiling" | "reviewing" | "outreach_ready";
@@ -32,6 +32,7 @@ type PipelineState = {
   metrics: Partial<Record<WorkStage, StepMetric>>;
   logs: string[];
   goal: AgentGoal;
+  metricRules: AgentMetricRules | null;
   usage: {
     collectedWorks: number;
     aiCalls: number;
@@ -52,6 +53,8 @@ type PersistedRun = {
   rounds?: AgentRound[];
   state: Partial<PipelineState>;
 };
+
+type OnlineLocalAgent = { id: string; name: string; version: string; lastSeenAt: string };
 
 type AgentRound = {
   id: number;
@@ -119,7 +122,7 @@ const steps: Array<{ id: WorkStage; title: string; description: string }> = [
   { id: "outreach_ready", title: "生成建联队列", description: "整理通过复筛的达人供建联使用" }
 ];
 
-function createInitialState(goal: AgentGoal, featuredAtStart = 0): PipelineState {
+function createInitialState(goal: AgentGoal, featuredAtStart = 0, metricRules: AgentMetricRules | null = null): PipelineState {
   return {
   stage: "idle",
   message: "等待启动完整流程",
@@ -131,6 +134,7 @@ function createInitialState(goal: AgentGoal, featuredAtStart = 0): PipelineState
   metrics: {},
     logs: [],
     goal,
+    metricRules,
     usage: { collectedWorks: 0, aiCalls: 0, currentRound: 1, noGrowthRounds: 0, featuredAtStart, featuredAdded: 0 }
   };
 }
@@ -178,6 +182,7 @@ function normalizeSavedState(saved: Partial<PipelineState>, fallbackGoal: AgentG
     metrics: saved.metrics || {},
     logs: Array.isArray(saved.logs) ? saved.logs.slice(-80) : [],
     goal: normalizeAgentGoal(saved.goal, fallbackGoal),
+    metricRules: normalizeAgentMetricRules(saved.metricRules),
     usage: { ...initialState.usage, ...(saved.usage || {}) }
   };
 }
@@ -193,10 +198,28 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
 }) {
   const initialState = createInitialState(task.agentGoalDefaults, featuredAtStart);
   const metricTemplate = resolveDiscoveryRuleTemplate(task).metricRules;
+  const isXhsTask = /小红书|xhs/i.test(String(task.platform || ""));
+  const defaultMetricDraft: AgentMetricRules = {
+    useCustom: false,
+    requireAvgLikes: metricTemplate.requireAvgLikes,
+    avgLikesThreshold: isXhsTask
+      ? Math.min(100, metricTemplate.avgLikesThreshold)
+      : metricTemplate.avgLikesThreshold,
+    requireViralWorks: metricTemplate.requireViralWorks,
+    viralLikesThreshold: isXhsTask
+      ? Math.min(500, metricTemplate.viralLikesThreshold)
+      : metricTemplate.viralLikesThreshold,
+    minViralWorks: metricTemplate.minViralWorks,
+    requireSampleWorks: metricTemplate.requireSampleWorks,
+    minSampleWorks: metricTemplate.minSampleWorks,
+    requireRecentUpdate: metricTemplate.requireRecentUpdate,
+    matchMode: metricTemplate.matchMode
+  };
   const storageKey = `kol-crm-agent-pipeline:${task.id}`;
   const pauseRef = useRef(false);
   const stageRef = useRef<Stage>("idle");
   const candidatesRef = useRef<any[]>([]);
+  const crawlTaskIdRef = useRef("");
   const stateRef = useRef<PipelineState>(initialState);
   const runIdRef = useRef<number | null>(null);
   const runVersionRef = useRef(0);
@@ -214,12 +237,38 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
   const [runStartStage, setRunStartStage] = useState<StartStage | null>(null);
   const [queueCounts, setQueueCounts] = useState({ profiling: 0, reviewing: 0 });
   const [goalDraft, setGoalDraft] = useState<AgentGoal>(task.agentGoalDefaults);
+  const [metricDraft, setMetricDraft] = useState<AgentMetricRules>(defaultMetricDraft);
   const goalDefaultsKey = JSON.stringify(task.agentGoalDefaults);
   const [goalSaving, setGoalSaving] = useState(false);
   const [goalMessage, setGoalMessage] = useState("");
   const [rounds, setRounds] = useState<AgentRound[]>([]);
   const [strategyDrafts, setStrategyDrafts] = useState<Record<number, { action: string; note: string }>>({});
   const [strategySavingId, setStrategySavingId] = useState<number | null>(null);
+  const [agentMode, setAgentMode] = useState<"direct" | "queue">("direct");
+  const [onlineAgents, setOnlineAgents] = useState<OnlineLocalAgent[]>([]);
+  const [agentDeviceId, setAgentDeviceId] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const response = await fetch("/api/local-agents", { cache: "no-store" });
+        const data = await response.json() as { mode?: "direct" | "queue"; agents?: OnlineLocalAgent[] };
+        if (cancelled) return;
+        const agents = data.agents || [];
+        setAgentMode(data.mode === "queue" ? "queue" : "direct");
+        setOnlineAgents(agents);
+        setAgentDeviceId((current) => agents.some((agent) => agent.id === current) ? current : (agents[0]?.id || ""));
+      } catch { /* main health polling will surface server failures */ }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 10_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    if (agentDeviceId) window.localStorage.setItem("kol-crm-local-agent-id", agentDeviceId);
+  }, [agentDeviceId]);
 
   function strategyDraft(round: AgentRound) {
     return strategyDrafts[round.id] || { action: round.strategy?.action || "request_human_review", note: "" };
@@ -263,7 +312,7 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     const response = await fetch("/api/agent/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ campaignTaskId: task.id, state: snapshot, enqueue, startStage })
+      body: JSON.stringify({ campaignTaskId: task.id, state: snapshot, enqueue, startStage, agentDeviceId: agentDeviceId || undefined })
     });
     const data = (await response.json().catch(() => ({}))) as { run?: PersistedRun; error?: string };
     if (!response.ok || !data.run) throw new Error(data.error || "创建 Agent 运行记录失败");
@@ -310,6 +359,7 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
           setRunStartStage(run.startStage || "crawling");
           setRounds(run.rounds || []);
           saved = normalizeSavedState(run.state, task.agentGoalDefaults);
+          setMetricDraft(saved.metricRules || defaultMetricDraft);
           setRunning(["queued", "running", "paused", "stopping"].includes(run.status));
           setPaused(run.status === "paused");
         } else {
@@ -513,13 +563,17 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     ensureWithinTime();
     enterStep("crawling", "正在启动关键词采集…", 1);
     const keyword = task.seedKeywords.join(",");
-    await requestJson("/api/crawler/douyin/start", {
+    const platformKey = /小红书|xhs/i.test(task.platform) ? "xhs" : "douyin";
+    const startedCrawler = await requestJson(`/api/crawler/${platformKey}/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         keyword,
         campaignTaskId: task.id,
-        maxNotes: Math.min(300, stateRef.current.goal.maxCollectedWorks),
+        maxNotes: platformKey === "xhs"
+          ? Math.min(25, stateRef.current.goal.maxCollectedWorks)
+          : Math.min(300, stateRef.current.goal.maxCollectedWorks),
+        restartCdpBeforeSpawn: platformKey !== "xhs",
         discoveryMode: "single",
         topicLimit: 3,
         publishWindowDays: 180,
@@ -531,11 +585,12 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
         }
       })
     });
+    crawlTaskIdRef.current = String(startedCrawler?.id || "");
 
     let collectedWorks = 0;
     while (true) {
       await waitWhilePaused();
-      const crawler = await requestJson("/api/crawler/douyin/status");
+      const crawler = await requestJson(`/api/crawler/${platformKey}/status`);
       const crawlerLogs = Array.isArray(crawler.logs) ? crawler.logs.map(String) : [];
       const latestLog = crawlerLogs.at(-1) || `采集状态：${crawler.status}`;
       collectedWorks = Number(crawler.collectedWorks || 0);
@@ -571,11 +626,13 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     await waitWhilePaused();
     enterStep("discovering", "正在从采集结果聚合候选达人…", 1);
     const keyword = task.seedKeywords.join(",");
-    const discovered = await requestJson("/api/discover/douyin", {
+    const platformKey = /小红书|xhs/i.test(task.platform) ? "xhs" : "douyin";
+    const discovered = await requestJson(`/api/discover/${platformKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         keyword,
+        crawlTaskId: platformKey === "xhs" ? crawlTaskIdRef.current : undefined,
         campaignTaskId: task.id,
         filters: {
           publishWindowDays: 180,
@@ -598,9 +655,10 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
   async function importCandidates() {
     ensureWithinTime();
     await waitWhilePaused();
-    enterStep("importing", "正在建立主页样本与画像队列…", candidatesRef.current.length);
+    enterStep("importing", "正在加入待画像…", candidatesRef.current.length);
     if (!candidatesRef.current.length) throw new Error("没有可导入候选，请从达人聚合步骤重试。");
-    const imported = await requestJson("/api/discover/douyin/import", {
+    const platformKey = /小红书|xhs/i.test(task.platform) ? "xhs" : "douyin";
+    const imported = await requestJson(`/api/discover/${platformKey}/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ candidates: candidatesRef.current, campaignTaskId: task.id })
@@ -627,7 +685,8 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     let rejected = 0;
     let failed = 0;
     let totalSamples = 0;
-    const batchSize = 30;
+    const isXhsTask = /小红书|xhs/i.test(task.platform);
+    const batchSize = isXhsTask ? 5 : 30;
 
     for (let index = 0; index < ids.length; index += batchSize) {
       await waitWhilePaused();
@@ -646,25 +705,26 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
           : `${Math.floor(elapsedSeconds / 60)} 分 ${elapsedSeconds % 60} 秒`;
         update({
           completed,
-          message: `第 ${batchNumber}/${batchTotal} 批仍在运行：MediaCrawler 正在采集 ${batch.length} 位达人主页，已等待 ${elapsedText}`
+          message: `第 ${batchNumber}/${batchTotal} 批仍在运行：${isXhsTask ? "MatrixFlow" : "MediaCrawler"} 正在采集 ${batch.length} 位达人主页，已等待 ${elapsedText}`
         });
         updateStep("profiling", {
           completed,
           total: ids.length,
-          detail: `本批正在采集/等待抖音响应，已运行 ${elapsedText}`
+          detail: `本批正在采集/等待${isXhsTask ? "小红书" : "抖音"}响应，已运行 ${elapsedText}`
         });
       }, 10_000);
       let profiled: any;
       try {
         updateUsage({ aiCalls: stateRef.current.usage.aiCalls + batch.length });
-        profiled = await requestJson("/api/review/douyin/batch", {
+        const portraitPlatform = /小红书|xhs/i.test(task.platform) ? "xhs" : "douyin";
+        profiled = await requestJson(`/api/review/${portraitPlatform}/batch`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             mode: "portrait",
             ids: batch,
             campaignTaskId: task.id,
-            workLimit: 10,
+            workLimit: 12,
             allowFullRetry: true,
             skipObviousMismatch: true
           })
@@ -738,6 +798,7 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     let featured = 0;
     let rejected = 0;
     let pending = 0;
+    const activeMetricRules = stateRef.current.metricRules || defaultMetricDraft;
     const reviewBatchSize = 30;
     for (let index = 0; index < ids.length; index += reviewBatchSize) {
       await waitWhilePaused();
@@ -759,16 +820,16 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
           campaignTaskId: task.id,
           mode: "metrics",
           rules: {
-            requireAvgLikes500: metricTemplate.requireAvgLikes,
-            avgLikesThreshold: metricTemplate.avgLikesThreshold,
-            requireViral2000: metricTemplate.requireViralWorks,
-            viralLikesThreshold: metricTemplate.viralLikesThreshold,
-            minViralWorks: metricTemplate.minViralWorks,
-            requireWorkCount10: metricTemplate.requireSampleWorks,
-            minSampleWorks: metricTemplate.minSampleWorks,
-            metricMatchMode: metricTemplate.matchMode,
+            requireAvgLikes500: activeMetricRules.requireAvgLikes,
+            avgLikesThreshold: activeMetricRules.avgLikesThreshold,
+            requireViral2000: activeMetricRules.requireViralWorks,
+            viralLikesThreshold: activeMetricRules.viralLikesThreshold,
+            minViralWorks: activeMetricRules.minViralWorks,
+            requireWorkCount10: activeMetricRules.requireSampleWorks,
+            minSampleWorks: activeMetricRules.minSampleWorks,
+            metricMatchMode: activeMetricRules.matchMode,
             requireRecentViral: false,
-            requireRecentUpdate: metricTemplate.requireRecentUpdate
+            requireRecentUpdate: activeMetricRules.requireRecentUpdate
           }
         })
       });
@@ -836,11 +897,12 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
     pauseRef.current = false;
     if (freshRun || fromStage === "crawling") {
       const startedAt = new Date().toISOString();
-      const nextState = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart);
+      const nextState = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart, normalizeAgentMetricRules(metricDraft));
       nextState.updatedAt = startedAt;
       nextState.usage.startedAt = startedAt;
       stageRef.current = "idle";
       candidatesRef.current = [];
+      crawlTaskIdRef.current = "";
       stateRef.current = nextState;
       runIdRef.current = null;
       runVersionRef.current = 0;
@@ -915,7 +977,7 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
   async function startRemoteRun() {
     setPersistenceError("");
     const startedAt = new Date().toISOString();
-    const snapshot = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart);
+    const snapshot = createInitialState(normalizeAgentGoal(goalDraft, task.agentGoalDefaults), featuredAtStart, normalizeAgentMetricRules(metricDraft));
     snapshot.updatedAt = startedAt;
     snapshot.usage.startedAt = startedAt;
     try {
@@ -1009,7 +1071,7 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
       <details className="agent-goal-editor" open={state.stage === "idle"}>
         <summary>
           <span><strong>本轮目标与停止条件</strong><small>未修改时使用当前任务的默认值</small></span>
-          <b>编辑目标</b>
+          <b><span aria-hidden="true">⚙</span> 编辑目标</b>
         </summary>
         <div className="agent-goal-grid">
           {([
@@ -1025,6 +1087,41 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
               <div><input disabled={running} min="1" type="number" value={goalDraft[key]} onChange={(event) => setGoalDraft((goal) => ({ ...goal, [key]: Number(event.target.value) }))} /><em>{unit}</em></div>
             </label>
           ))}
+        </div>
+        <div className="agent-metric-editor">
+          <div className="agent-metric-heading">
+            <label>
+              <input
+                checked={metricDraft.useCustom}
+                disabled={running}
+                onChange={(event) => setMetricDraft((current) => ({ ...current, useCustom: event.target.checked }))}
+                type="checkbox"
+              />
+              <span><strong>自定义本轮数据门槛</strong><small>不勾选时使用当前品类默认值</small></span>
+            </label>
+            <select disabled={running || !metricDraft.useCustom} onChange={(event) => setMetricDraft((current) => ({ ...current, matchMode: event.target.value === "all" ? "all" : "any" }))} value={metricDraft.matchMode}>
+              <option value="any">点赞与爆款满足任一项</option>
+              <option value="all">点赞与爆款全部满足</option>
+            </select>
+          </div>
+          <div className="agent-metric-grid">
+            <label>
+              <span><input checked={metricDraft.requireAvgLikes} disabled={running || !metricDraft.useCustom} onChange={(event) => setMetricDraft((current) => ({ ...current, requireAvgLikes: event.target.checked }))} type="checkbox" /> 平均点赞</span>
+              <input disabled={running || !metricDraft.useCustom || !metricDraft.requireAvgLikes} min="0" onChange={(event) => setMetricDraft((current) => ({ ...current, avgLikesThreshold: Number(event.target.value) }))} type="number" value={metricDraft.avgLikesThreshold} />
+            </label>
+            <label>
+              <span><input checked={metricDraft.requireViralWorks} disabled={running || !metricDraft.useCustom} onChange={(event) => setMetricDraft((current) => ({ ...current, requireViralWorks: event.target.checked }))} type="checkbox" /> 爆款作品</span>
+              <div><input disabled={running || !metricDraft.useCustom || !metricDraft.requireViralWorks} min="1" onChange={(event) => setMetricDraft((current) => ({ ...current, minViralWorks: Number(event.target.value) }))} type="number" value={metricDraft.minViralWorks} /><em>条，点赞 ≥</em><input disabled={running || !metricDraft.useCustom || !metricDraft.requireViralWorks} min="0" onChange={(event) => setMetricDraft((current) => ({ ...current, viralLikesThreshold: Number(event.target.value) }))} type="number" value={metricDraft.viralLikesThreshold} /></div>
+            </label>
+            <label>
+              <span><input checked={metricDraft.requireSampleWorks} disabled={running || !metricDraft.useCustom} onChange={(event) => setMetricDraft((current) => ({ ...current, requireSampleWorks: event.target.checked }))} type="checkbox" /> 主页样本数</span>
+              <input disabled={running || !metricDraft.useCustom || !metricDraft.requireSampleWorks} min="1" onChange={(event) => setMetricDraft((current) => ({ ...current, minSampleWorks: Number(event.target.value) }))} type="number" value={metricDraft.minSampleWorks} />
+            </label>
+            <label className="agent-metric-check-only">
+              <span><input checked={metricDraft.requireRecentUpdate} disabled={running || !metricDraft.useCustom} onChange={(event) => setMetricDraft((current) => ({ ...current, requireRecentUpdate: event.target.checked }))} type="checkbox" /> 近1个月有更新</span>
+              <small>关闭时不限制更新时间</small>
+            </label>
+          </div>
         </div>
         <div className="task-actions agent-goal-actions">
           <button className="secondary-button" disabled={running} onClick={() => setGoalDraft(task.agentGoalDefaults)} type="button">恢复任务默认值</button>
@@ -1043,16 +1140,24 @@ export function AgentPipelineDashboard({ task, featuredAtStart = 0, onTaskUpdate
       </div>
 
       <div className="task-actions agent-primary-actions">
+        {agentMode === "queue" ? (
+          <label className="agent-start-stage">
+            <span>在这台电脑采集</span>
+            <select disabled={running} onChange={(event) => setAgentDeviceId(event.target.value)} value={agentDeviceId}>
+              {onlineAgents.length ? onlineAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}（在线）</option>) : <option value="">未检测到采集助手</option>}
+            </select>
+          </label>
+        ) : null}
         <label className="agent-start-stage">
           <span>从哪一步开始</span>
           <select disabled={running} onChange={(event) => setStartStage(event.target.value as StartStage)} value={startStage}>
-            <option value="crawling">1. 从关键词作品采集开始（完整流程）</option>
+            <option value="crawling">1. 完整流程（先消化待画像，不足再采集）</option>
             <option value="discovering">2. 从已有采集结果聚合开始</option>
             <option value="profiling">3. 从样本与 AI 画像开始（{queueCounts.profiling} 人）</option>
             <option value="reviewing">4. 从待选库数据门槛开始（{queueCounts.reviewing} 人）</option>
           </select>
         </label>
-        <button disabled={running || !hydrated || Boolean(persistenceError)} onClick={() => void startRemoteRun()} type="button">
+        <button disabled={running || !hydrated || Boolean(persistenceError) || (agentMode === "queue" && !agentDeviceId)} onClick={() => void startRemoteRun()} type="button">
           {!hydrated ? "正在恢复运行状态…" : running ? "后台 Agent 执行中…" : startStage === "crawling" ? "启动后台完整流程" : "从所选步骤后台启动"}
         </button>
         {running && !paused ? <button className="secondary-button" onClick={pause} type="button">暂停</button> : null}

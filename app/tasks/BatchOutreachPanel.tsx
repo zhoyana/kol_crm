@@ -3,17 +3,21 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type BatchCandidate = {
+export type BatchCandidate = {
   creatorId: string;
   creatorName: string;
+  platform: string;
   profileUrl: string;
   taskKind: "initial" | "followup" | "negotiate";
   defaultScript: string;
+  queueEnteredAt: string;
 };
 
 type Props = {
   candidates: BatchCandidate[];
   campaignTaskId?: number | null;
+  managedSelection?: boolean;
+  onSent?: (creatorIds: string[]) => void;
 };
 
 type ItemState = {
@@ -23,24 +27,37 @@ type ItemState = {
 };
 
 const MAX_BATCH_SIZE = 5;
+const AI_GENERATION_CONCURRENCY = 3;
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
+export function BatchOutreachPanel({ candidates, campaignTaskId, managedSelection = false, onSent }: Props) {
   const router = useRouter();
   const storageKey = `kol-crm-outreach-queue:${campaignTaskId || "all"}`;
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [items, setItems] = useState<Record<string, ItemState>>({});
   const itemsRef = useRef<Record<string, ItemState>>({});
-  const pauseRequestedRef = useRef(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSending, setIsSending] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
   const [summary, setSummary] = useState("");
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
 
   useEffect(() => {
+    if (managedSelection) {
+      const selected = candidates.slice(0, MAX_BATCH_SIZE);
+      setSelectedIds(selected.map((candidate) => candidate.creatorId));
+      setItems((current) => {
+        const next = { ...current };
+        for (const candidate of selected) {
+          next[candidate.creatorId] ||= { script: candidate.defaultScript, status: "ready", message: "" };
+        }
+        itemsRef.current = next;
+        return next;
+      });
+      return;
+    }
     try {
       const saved = JSON.parse(window.localStorage.getItem(storageKey) || "{}") as {
         selectedIds?: string[];
@@ -61,7 +78,7 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     } catch {
       // Ignore broken local queue snapshots.
     }
-  }, [candidates, storageKey]);
+  }, [candidates, managedSelection, storageKey]);
 
   useEffect(() => {
     window.localStorage.setItem(storageKey, JSON.stringify({ selectedIds, items }));
@@ -96,6 +113,27 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     });
   }
 
+  function toggleSelectAll() {
+    setSummary("");
+    const available = candidates.slice(0, MAX_BATCH_SIZE);
+    const availableIds = available.map((candidate) => candidate.creatorId);
+    const allSelected = availableIds.length > 0 && availableIds.every((id) => selectedIds.includes(id));
+    if (allSelected) {
+      setSelectedIds([]);
+      return;
+    }
+    setSelectedIds(availableIds);
+    setItems((current) => {
+      const next = { ...current };
+      for (const candidate of available) {
+        next[candidate.creatorId] ||= { script: candidate.defaultScript, status: "ready", message: "" };
+      }
+      itemsRef.current = next;
+      return next;
+    });
+    if (candidates.length > MAX_BATCH_SIZE) setSummary(`每批最多 ${MAX_BATCH_SIZE} 人，已选择列表前 ${MAX_BATCH_SIZE} 位。`);
+  }
+
   function updateItem(creatorId: string, patch: Partial<ItemState>) {
     setItems((current) => {
       const next = {
@@ -112,29 +150,8 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     });
   }
 
-  async function waitWhilePaused() {
-    while (pauseRequestedRef.current) {
-      await wait(500);
-    }
-  }
-
   async function interruptibleWait(seconds: number) {
-    for (let elapsed = 0; elapsed < seconds; elapsed += 1) {
-      await waitWhilePaused();
-      await wait(1000);
-    }
-  }
-
-  function pauseQueue() {
-    pauseRequestedRef.current = true;
-    setIsPaused(true);
-    setSummary("队列已暂停；当前正在执行的单条任务会完成，后续任务暂不启动。");
-  }
-
-  function resumeQueue() {
-    pauseRequestedRef.current = false;
-    setIsPaused(false);
-    setSummary("队列已继续。");
+    await wait(seconds * 1000);
   }
 
   async function generateAll() {
@@ -145,14 +162,14 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     setIsGenerating(true);
     setSummary("");
     let succeeded = 0;
+    let nextIndex = 0;
 
-    for (const candidate of selectedCandidates) {
-      await waitWhilePaused();
+    async function generateOne(candidate: BatchCandidate) {
       updateItem(candidate.creatorId, { status: "generating", message: "正在生成个性化话术…" });
       try {
         const response = await fetch("/api/outreach/script", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-kol-agent-id": window.localStorage.getItem("kol-crm-local-agent-id") || "" },
           body: JSON.stringify({
             creatorId: candidate.creatorId,
             taskKind: candidate.taskKind,
@@ -167,7 +184,7 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
             status: "failed",
             message: result.error || "AI话术生成失败，可使用默认话术或重新生成。"
           });
-          continue;
+          return;
         }
         updateItem(candidate.creatorId, {
           script: result.script,
@@ -183,6 +200,17 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
         });
       }
     }
+
+    async function runWorker() {
+      while (nextIndex < selectedCandidates.length) {
+        const candidate = selectedCandidates[nextIndex];
+        nextIndex += 1;
+        await generateOne(candidate);
+      }
+    }
+
+    const workerCount = Math.min(AI_GENERATION_CONCURRENCY, selectedCandidates.length);
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 
     setIsGenerating(false);
     setSummary(`已完成话术生成：${succeeded}/${selectedCandidates.length} 人。发送前请逐条检查。`);
@@ -210,7 +238,6 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     let failed = 0;
 
     for (let index = 0; index < prepared.length; index += 1) {
-      await waitWhilePaused();
       const candidate = prepared[index];
       const script = (itemsRef.current[candidate.creatorId]?.script || candidate.defaultScript).trim();
       updateItem(candidate.creatorId, { status: "sending", message: `正在发送（${index + 1}/${prepared.length}）…` });
@@ -223,7 +250,8 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
             creatorId: candidate.creatorId,
             profileUrl: candidate.profileUrl,
             message: script,
-            taskKind: candidate.taskKind
+            taskKind: candidate.taskKind,
+            campaignTaskId: campaignTaskId || null
           })
         });
         const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
@@ -254,13 +282,9 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
 
     setIsSending(false);
     setSummary(`批量发送完成：成功 ${sent} 条，失败 ${failed} 条。`);
+    const sentIds = prepared.filter((candidate) => itemsRef.current[candidate.creatorId]?.status === "sent").map((candidate) => candidate.creatorId);
+    if (sentIds.length) onSent?.(sentIds);
     router.refresh();
-  }
-
-  async function runOneClick() {
-    const generated = await generateAll();
-    if (!generated) return;
-    await sendCandidates();
   }
 
   async function retryFailed() {
@@ -275,31 +299,80 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
     await sendCandidates(failedCandidates);
   }
 
+  async function generateAndSend() {
+    const generated = await generateAll();
+    if (generated) await sendCandidates();
+  }
+
+  async function markCreatorSent(candidate: BatchCandidate) {
+    setUpdatingId(candidate.creatorId);
+    setSummary("");
+    try {
+      const response = await fetch(`/api/creators/${candidate.creatorId}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          outreachStatus: "已建联",
+          action: "mark_sent",
+          content: `已将 ${candidate.creatorName} 标记为已发送。`,
+          campaignTaskId: campaignTaskId || null
+        })
+      });
+      const result = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) {
+        setSummary(result.error || "状态更新失败，请重试。");
+        return;
+      }
+      setSummary(`${candidate.creatorName} 已标记发送。`);
+      router.refresh();
+    } catch {
+      setSummary("状态接口没有响应，请重试。");
+    } finally {
+      setUpdatingId(null);
+    }
+  }
+
   return (
-    <section className="panel batch-outreach-panel workflow-section workflow-action-section">
+    <section className={`panel batch-outreach-panel workflow-section workflow-action-section${managedSelection ? " creator-outreach-dock" : ""}`}>
       <div className="panel-header">
         <div>
-          <span className="workflow-kicker">02 · 批量执行</span>
-          <h2>批量个性化建联</h2>
+          <span className="workflow-kicker">建联执行</span>
+          <h2>已选达人话术</h2>
           <p>每批最多5人。先由AI逐人生成话术并检查，再确认顺序发送。</p>
         </div>
-        <strong>{selectedIds.length}/{MAX_BATCH_SIZE}</strong>
+        {!managedSelection ? <div className="batch-selection-tools">
+          <button className="secondary-button" disabled={isGenerating || isSending || !candidates.length} onClick={toggleSelectAll} type="button">
+            {candidates.slice(0, MAX_BATCH_SIZE).every((candidate) => selectedIds.includes(candidate.creatorId)) ? "取消全选" : "一键全选"}
+          </button>
+          <strong>{selectedIds.length}/{MAX_BATCH_SIZE}</strong>
+        </div> : <strong>已选 {selectedIds.length}/{MAX_BATCH_SIZE} 人</strong>}
       </div>
 
       <div className="batch-outreach-list">
         {candidates.length ? candidates.slice(0, 30).map((candidate) => {
           const state = items[candidate.creatorId];
+          const enteredAt = new Date(candidate.queueEnteredAt).getTime();
+          const isNew = Number.isFinite(enteredAt) && enteredAt >= Date.now() - 24 * 60 * 60 * 1000;
           return (
             <article className="batch-outreach-item" key={candidate.creatorId}>
-              <label>
+              {isNew ? <span className="batch-new-badge">NEW</span> : null}
+              <div className="batch-card-head">
+                <a href={candidate.profileUrl} rel="noreferrer" target="_blank">
+                  <strong>{candidate.creatorName}</strong>
+                  <span>打开{candidate.platform === "小红书" ? "小红书" : "抖音"}主页 ↗</span>
+                </a>
+                <span className={`batch-platform-badge ${candidate.platform === "小红书" ? "xhs" : "douyin"}`}>
+                  {candidate.platform || "抖音"}
+                </span>
+                {!managedSelection ? <label aria-label={`选择 ${candidate.creatorName}`}>
                 <input
                   checked={selectedIds.includes(candidate.creatorId)}
                   disabled={isGenerating || isSending}
                   onChange={() => toggle(candidate)}
                   type="checkbox"
                 />
-                <strong>{candidate.creatorName}</strong>
-              </label>
+                </label> : null}
+              </div>
               {selectedIds.includes(candidate.creatorId) ? (
                 <>
                   <textarea
@@ -311,27 +384,30 @@ export function BatchOutreachPanel({ candidates, campaignTaskId }: Props) {
                   <span className={`batch-status ${state?.status || "ready"}`}>{state?.message || "等待生成个性化话术"}</span>
                 </>
               ) : null}
+              <div className="batch-card-actions">
+                <button
+                  disabled={Boolean(updatingId) || isGenerating || isSending}
+                  onClick={() => markCreatorSent(candidate)}
+                  type="button"
+                >
+                  {updatingId === candidate.creatorId ? "处理中…" : "标记已发送"}
+                </button>
+              </div>
             </article>
           );
         }) : <p className="empty-state">当前没有未建联的精选达人。</p>}
       </div>
 
       <div className="task-actions">
-        <button className="go-contact-button" disabled={!selectedIds.length || isGenerating || isSending} onClick={runOneClick} type="button">
-          一键生成并进入发送队列
-        </button>
         <button disabled={!selectedIds.length || isGenerating || isSending} onClick={generateAll} type="button">
-          {isGenerating ? "正在逐人生成…" : "批量生成个性化话术"}
+          {isGenerating ? "正在逐人生成…" : "批量生成个性化 AI 话术"}
         </button>
         <button className="go-contact-button" disabled={!selectedIds.length || isGenerating || isSending} onClick={() => sendCandidates()} type="button">
           {isSending ? "批量发送中…" : "检查后确认批量发送"}
         </button>
-        {isSending && !isPaused ? (
-          <button className="secondary-button" onClick={pauseQueue} type="button">暂停队列</button>
-        ) : null}
-        {isSending && isPaused ? (
-          <button className="secondary-button" onClick={resumeQueue} type="button">继续队列</button>
-        ) : null}
+        <button className="go-contact-button" disabled={!selectedIds.length || isGenerating || isSending} onClick={generateAndSend} type="button">
+          {isGenerating || isSending ? "处理中…" : "一键生成并发送"}
+        </button>
         <button
           className="secondary-button"
           disabled={isGenerating || isSending || !Object.values(items).some((item) => item.status === "failed")}

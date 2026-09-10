@@ -33,6 +33,9 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   if (!body) {
     return NextResponse.json({ error: "没有收到要保存的内容。" }, { status: 400 });
   }
+  if (body.outreachStatus && !["未建联", "已建联"].includes(body.outreachStatus)) {
+    return NextResponse.json({ error: "建联状态只能是“未建联”或“已建联”。" }, { status: 400 });
+  }
 
   try {
     // prisma singleton from import

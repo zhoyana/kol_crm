@@ -9,6 +9,7 @@ import type { HomepageReviewRules } from "@/lib/douyin-homepage";
 
 type ReviewResult = {
   id?: number;
+  externalId?: string;
   ok?: boolean;
   skipped?: boolean;
   message?: string;
@@ -36,6 +37,19 @@ type BatchReviewResponse = {
 type ReviewRunOptions = {
   keepRunningState?: boolean;
 };
+
+type BatchStage = "portrait" | "metrics";
+
+type BatchProgress = {
+  stage: BatchStage;
+  completed: number;
+  total: number;
+  platform?: string;
+};
+
+function isXhsCreator(creator: ReviewCreator): boolean {
+  return /小红书|xhs/i.test(creator.platform) || /^xhs-|^profile\//i.test(creator.externalId || "");
+}
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(value || 0);
@@ -95,29 +109,32 @@ type ReviewClientProps = {
   initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
   initialCampaignTaskId: number | null;
+  initialPlatform: "全部" | "抖音" | "小红书";
 };
 
-export function ReviewClient({ initialCreators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId }: ReviewClientProps) {
+export function ReviewClient({ initialCreators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId, initialPlatform }: ReviewClientProps) {
   const initialCampaignTask = initialCampaignTasks.find((task) => task.id === initialCampaignTaskId);
   const initialMetricRules = resolveDiscoveryRuleTemplate(initialCampaignTask).metricRules;
+  const initialIsDouyin = !/小红书|xhs/i.test(String(initialCampaignTask?.platform || "抖音"));
   const [creators, setCreators] = useState([...initialCreators].sort((a, b) => creatorPriority(b) - creatorPriority(a)));
   const [campaignTasks] = useState(initialCampaignTasks);
   const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
+  const [platform] = useState(initialPlatform);
   const [runningId, setRunningId] = useState<number | null>(null);
-  const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [results, setResults] = useState<Record<number, ReviewResult>>({});
   const [onlyPriorityBatch, setOnlyPriorityBatch] = useState(false);
   const [rules, setRules] = useState<HomepageReviewRules>({
-    requireAvgLikes500: initialMetricRules.requireAvgLikes,
-    requireViral2000: initialMetricRules.requireViralWorks,
-    requireWorkCount10: initialMetricRules.requireSampleWorks,
+    requireAvgLikes500: initialIsDouyin || initialMetricRules.requireAvgLikes,
+    requireViral2000: initialIsDouyin || initialMetricRules.requireViralWorks,
+    requireWorkCount10: initialIsDouyin || initialMetricRules.requireSampleWorks,
     requireRecentViral: false,
-    requireRecentUpdate: initialMetricRules.requireRecentUpdate,
-    avgLikesThreshold: initialMetricRules.avgLikesThreshold,
-    viralLikesThreshold: initialMetricRules.viralLikesThreshold,
+    requireRecentUpdate: initialIsDouyin || initialMetricRules.requireRecentUpdate,
+    avgLikesThreshold: Math.max(initialIsDouyin ? 500 : 0, initialMetricRules.avgLikesThreshold),
+    viralLikesThreshold: Math.max(initialIsDouyin ? 2000 : 0, initialMetricRules.viralLikesThreshold),
     minViralWorks: initialMetricRules.minViralWorks,
-    minSampleWorks: initialMetricRules.minSampleWorks,
-    metricMatchMode: initialMetricRules.matchMode
+    minSampleWorks: Math.max(initialIsDouyin ? 10 : 1, initialMetricRules.minSampleWorks),
+    metricMatchMode: initialIsDouyin ? "all" : initialMetricRules.matchMode
   });
 
   const selectedRuleLabels = useMemo(() => {
@@ -135,11 +152,46 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
     () => campaignTasks.find((task) => String(task.id) === selectedCampaignTaskId) || null,
     [campaignTasks, selectedCampaignTaskId]
   );
+  const visibleCampaignTasks = useMemo(
+    () => campaignTasks.filter((task) => {
+      if (platform === "全部") return true;
+      const taskPlatform = /小红书|xhs/i.test(String(task.platform || "")) ? "小红书" : "抖音";
+      return taskPlatform === platform;
+    }),
+    [campaignTasks, platform]
+  );
+  const platformTaskCounts = useMemo(() => ({
+    全部: campaignTasks.length,
+    抖音: campaignTasks.filter((task) => !/小红书|xhs/i.test(String(task.platform || ""))).length,
+    小红书: campaignTasks.filter((task) => /小红书|xhs/i.test(String(task.platform || ""))).length
+  }), [campaignTasks]);
+  const isDouyinTask = !/小红书|xhs/i.test(String(selectedCampaignTask?.platform || "抖音"));
 
   function changeCampaignTask(taskId: string) {
     setSelectedCampaignTaskId(taskId);
-    const suffix = taskId ? `?campaignTaskId=${encodeURIComponent(taskId)}` : "";
-    window.location.href = `/review${suffix}`;
+    const params = new URLSearchParams();
+    if (taskId) params.set("campaignTaskId", taskId);
+    const nextTask = campaignTasks.find((task) => String(task.id) === taskId);
+    const nextTaskPlatform = nextTask
+      ? (/小红书|xhs/i.test(String(nextTask.platform || "")) ? "小红书" : "抖音")
+      : platform;
+    const effectivePlatform = platform === "全部" && taskId ? nextTaskPlatform : platform;
+    if (effectivePlatform === "抖音") params.set("platform", "douyin");
+    if (effectivePlatform === "小红书") params.set("platform", "xhs");
+    window.location.href = `/review${params.size ? `?${params.toString()}` : ""}`;
+  }
+
+  function changePlatform(nextPlatform: "全部" | "抖音" | "小红书") {
+    const taskPlatform = selectedCampaignTask
+      ? (/小红书|xhs/i.test(String(selectedCampaignTask.platform || "")) ? "小红书" : "抖音")
+      : null;
+    const params = new URLSearchParams();
+    if (nextPlatform === "抖音") params.set("platform", "douyin");
+    if (nextPlatform === "小红书") params.set("platform", "xhs");
+    if (selectedCampaignTaskId && (nextPlatform === "全部" || taskPlatform === nextPlatform)) {
+      params.set("campaignTaskId", selectedCampaignTaskId);
+    }
+    window.location.href = `/review${params.size ? `?${params.toString()}` : ""}`;
   }
 
   function toggleRule(key: keyof HomepageReviewRules) {
@@ -196,11 +248,12 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
   }
 
   async function reviewAll() {
-    setIsBatchRunning(true);
+    const batch = buildBatchQueue(creators, onlyPriorityBatch);
+    if (!batch.length) return;
+    setBatchProgress({ stage: "metrics", completed: 0, total: batch.length });
     setRunningId(null);
 
     try {
-      const batch = buildBatchQueue(creators, onlyPriorityBatch);
       setResults((current) => {
         const next = { ...current };
         for (const creator of batch) {
@@ -241,15 +294,34 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
       });
       const removableIds = new Set(resultRows.filter((item) => !item.error && item.id).map((item) => item.id));
       setCreators((current) => current.filter((creator) => !removableIds.has(creator.id)));
+      setBatchProgress({ stage: "metrics", completed: resultRows.length, total: batch.length });
+    } catch {
+      setResults((current) => {
+        const next = { ...current };
+        for (const creator of batch) next[creator.id] = { error: "数据筛选请求中断，请稍后重试。" };
+        return next;
+      });
     } finally {
       setRunningId(null);
-      setIsBatchRunning(false);
+      setBatchProgress(null);
     }
   }
 
   async function profileCreators(targets: ReviewCreator[]) {
     if (!targets.length) return;
-    setIsBatchRunning(true);
+    // Never mix platform IDs in one crawler request. In particular, XHS
+    // `profile/...` IDs make the Douyin creator crawler wait without results.
+    const chunks: Array<{ creators: ReviewCreator[]; endpoint: string; platform: string }> = [];
+    const platformGroups = [
+      { creators: targets.filter((creator) => !isXhsCreator(creator)), endpoint: "/api/review/douyin/batch", platform: "抖音" },
+      { creators: targets.filter(isXhsCreator), endpoint: "/api/review/xhs/batch", platform: "小红书" }
+    ];
+    for (const group of platformGroups) {
+      for (let index = 0; index < group.creators.length; index += 10) {
+        chunks.push({ ...group, creators: group.creators.slice(index, index + 10) });
+      }
+    }
+    setBatchProgress({ stage: "portrait", completed: 0, total: targets.length });
     setRunningId(null);
     setResults((current) => {
       const next = { ...current };
@@ -258,71 +330,128 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
     });
 
     try {
-      const response = await fetch("/api/review/douyin/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "portrait",
-          ids: targets.map((creator) => creator.externalId || String(creator.id)),
-          campaignTaskId: selectedCampaignTaskId || null,
-          workLimit: 10,
-          allowFullRetry: true,
-          skipObviousMismatch: true
-        })
-      });
-      const data = (await response.json()) as BatchReviewResponse;
-      if (!response.ok) {
+      let completed = 0;
+      for (const chunkInfo of chunks) {
+        const chunk = chunkInfo.creators;
+        setBatchProgress({ stage: "portrait", completed, total: targets.length, platform: chunkInfo.platform });
         setResults((current) => {
           const next = { ...current };
-          for (const creator of targets) next[creator.id] = { error: data.error || "主页样本与 AI 画像失败" };
+          for (const creator of chunk) next[creator.id] = { message: `正在处理（${completed + 1}-${Math.min(completed + chunk.length, targets.length)} / ${targets.length}）…` };
           return next;
         });
-        return;
+        const response = await fetch(chunkInfo.endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "portrait",
+            ids: chunk.map((creator) => creator.externalId || String(creator.id)),
+            campaignTaskId: selectedCampaignTaskId || null,
+            // Keep this identical to the Agent path: request 12 works so the
+            // strict 10-valid-sample gate still has a small failure buffer.
+            workLimit: 12,
+            allowFullRetry: true,
+            skipObviousMismatch: true
+          })
+        });
+        const data = (await response.json()) as BatchReviewResponse;
+        if (!response.ok) {
+          setResults((current) => {
+            const next = { ...current };
+            for (const creator of chunk) next[creator.id] = { error: data.error || "主页样本与 AI 画像失败" };
+            return next;
+          });
+        } else {
+          const rows = data.results || [];
+          const rowById = new Map(rows.filter((row) => row.id).map((row) => [row.id as number, row]));
+          const rowByExternalId = new Map(
+            rows
+              .filter((row) => (row as ReviewResult & { externalId?: string }).externalId)
+              .map((row) => [(row as ReviewResult & { externalId?: string }).externalId as string, row])
+          );
+          setResults((current) => {
+            const next = { ...current };
+            for (const row of rows) {
+              const creator = row.id
+                ? chunk.find((item) => item.id === row.id)
+                : chunk.find((item) => item.externalId === row.externalId);
+              if (creator) next[creator.id] = row;
+            }
+            return next;
+          });
+          setCreators((current) => current
+            .map((creator) => {
+              const row = rowById.get(creator.id) || rowByExternalId.get(creator.externalId);
+              if (!row) return creator;
+              return {
+                ...creator,
+                poolStatus: row.poolStatus || creator.poolStatus,
+                screeningStatus: row.screeningStatus || creator.screeningStatus,
+                screeningSummary: row.screeningSummary || row.message || creator.screeningSummary,
+                avgLikes: row.avgLikes ?? creator.avgLikes,
+                maxLikes: row.maxLikes ?? creator.maxLikes,
+                recentWorkCount: row.recentWorkCount ?? creator.recentWorkCount,
+                viralWorkCount: row.viralWorkCount ?? creator.viralWorkCount,
+                sampleWorkCount: row.sampleWorkCount ?? creator.sampleWorkCount
+              };
+            })
+            .filter((creator) => !["rejected", "skipped"].includes(creator.poolStatus)));
+        }
+        completed += chunk.length;
+        setBatchProgress({ stage: "portrait", completed, total: targets.length, platform: chunkInfo.platform });
       }
-
-      const rows = data.results || [];
-      const rowMap = new Map(rows.filter((row) => row.id).map((row) => [row.id as number, row]));
+    } catch {
       setResults((current) => {
         const next = { ...current };
-        for (const row of rows) if (row.id) next[row.id] = row;
+        for (const creator of targets) {
+          if (!next[creator.id] || next[creator.id].message) next[creator.id] = { error: "画像请求中断，请检查 Chrome/CDP 后重试。" };
+        }
         return next;
       });
-      setCreators((current) => current
-        .map((creator) => {
-          const row = rowMap.get(creator.id);
-          if (!row) return creator;
-          return {
-            ...creator,
-            poolStatus: row.poolStatus || creator.poolStatus,
-            screeningStatus: row.screeningStatus || creator.screeningStatus,
-            screeningSummary: row.screeningSummary || row.message || creator.screeningSummary,
-            avgLikes: row.avgLikes ?? creator.avgLikes,
-            maxLikes: row.maxLikes ?? creator.maxLikes,
-            recentWorkCount: row.recentWorkCount ?? creator.recentWorkCount,
-            viralWorkCount: row.viralWorkCount ?? creator.viralWorkCount,
-            sampleWorkCount: row.sampleWorkCount ?? creator.sampleWorkCount
-          };
-        })
-        .filter((creator) => !["rejected", "skipped"].includes(creator.poolStatus)));
     } finally {
-      setIsBatchRunning(false);
+      setBatchProgress(null);
     }
   }
 
+  const isBatchRunning = batchProgress !== null;
   const isBusy = runningId !== null || isBatchRunning;
   const portraitQueue = creators.filter((creator) => creator.poolStatus === "pending_review");
   const metricQueue = creators.filter((creator) => creator.poolStatus === "candidate" && creator.screeningStatus === "portrait_passed");
-  const priorityCount = metricQueue.filter(isPriorityCreator).length;
   const batchCount = buildBatchQueue(creators, onlyPriorityBatch).length;
-  const batchModeText = onlyPriorityBatch && priorityCount === 0 && creators.length ? "暂无强候选，将按数据表现排序" : "只读取已记录的主页指标，不重新采集";
+  const runSummary = useMemo(() => {
+    const rows = Object.values(results).filter((result) => !result.message);
+    return {
+      featured: rows.filter((result) => result.poolStatus === "featured").length,
+      candidate: rows.filter((result) => result.poolStatus === "candidate").length,
+      excluded: rows.filter((result) =>
+        Boolean(result.error) ||
+        Boolean(result.skipped) ||
+        result.ok === false ||
+        ["pending_review", "rejected", "skipped"].includes(result.poolStatus || "")
+      ).length
+    };
+  }, [results]);
 
   return (
     <div className="discover-stack review-layout">
       <section className="panel review-note workflow-guide">
         <span className="review-guide-icon">i</span>
         <div>
-          <h2>分层筛选说明</h2>
-          <p>样本与画像队列负责补齐主页作品并调用品类 AI；画像通过后进入待选库。数据门槛阶段只读快照，不再启动 Crawler 或调用 AI。</p>
+          <h2>从画像到入库</h2>
+          <p>按三个阶段从左到右处理：生成内容画像 → 筛选数据表现 → 查看本轮入库结果。</p>
+        </div>
+      </section>
+
+      <section className={`platform-overview review-platform-overview ${platform === "抖音" ? "douyin-active" : platform === "小红书" ? "xhs-active" : "all-active"}`}>
+        <div className="platform-switcher" aria-label="品类任务平台">
+          {(["全部", "抖音", "小红书"] as const).map((item) => (
+            <button className={platform === item ? "active" : ""} key={item} onClick={() => changePlatform(item)} type="button">
+              <span className={`platform-logo ${item === "抖音" ? "douyin" : item === "小红书" ? "xhs" : "all"}`}>
+                {item === "全部" ? "全" : item === "抖音" ? "抖" : "红"}
+              </span>
+              <span>{item === "全部" ? "全部任务" : `${item}任务`}</span>
+              <strong>{platformTaskCounts[item]}</strong>
+            </button>
+          ))}
         </div>
       </section>
 
@@ -333,10 +462,10 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
           <p>数据门槛结果会写回当前品类任务；作品画像仍由该品类的 AI 模板负责。</p>
         </div>
         <div className="campaign-task-picker-controls">
-          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="review-brand-library" />
+          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={visibleCampaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="review-brand-library" />
           <select hidden onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
             <option value="">全局样本与数据队列</option>
-            {campaignTasks.map((task) => (
+            {visibleCampaignTasks.map((task) => (
               <option key={task.id} value={task.id}>
                 {task.name}
               </option>
@@ -368,20 +497,67 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
       <section className="panel workflow-section workflow-action-section">
         <div className="panel-header">
           <div>
-            <span className="workflow-kicker">02 · 精选门槛</span>
-            <h2>精选库规则</h2>
-            <p>当前规则：{selectedRuleLabels}</p>
-          </div>
-          <div className="task-actions">
-            <button disabled={!portraitQueue.length || isBusy} onClick={() => void profileCreators(portraitQueue.slice(0, 30))} type="button">
-              {isBatchRunning ? "处理中..." : `补齐样本并画像前${Math.min(30, portraitQueue.length)}个`}
-            </button>
-            <button disabled={!batchCount || isBusy} onClick={reviewAll} type="button">
-              {isBatchRunning ? "处理中..." : `对前${batchCount}个应用数据门槛`}
-            </button>
+            <span className="workflow-kicker">02 · 画像与筛选</span>
+            <h2>按阶段完成达人筛选</h2>
+            <p>系统会自动保留处理中间状态；业务只需依次完成前两步。</p>
           </div>
         </div>
 
+        <div className="review-stage-grid">
+          <article className={`review-stage-card ${portraitQueue.length ? "active" : "complete"}`}>
+            <span className="review-stage-number">1</span>
+            <div>
+              <small>内容判断</small>
+              <h3>等待生成画像</h3>
+              <strong>{portraitQueue.length} 人</strong>
+              <p>读取主页作品，判断内容是否符合当前品类。</p>
+            </div>
+            <button disabled={!portraitQueue.length || isBusy} onClick={() => void profileCreators(portraitQueue.slice(0, 30))} type="button">
+              {batchProgress?.stage === "portrait"
+                ? `正在生成${batchProgress.platform ? `${batchProgress.platform} ` : ""}画像 ${batchProgress.completed}/${batchProgress.total}`
+                : portraitQueue.length
+                  ? `生成画像（前 ${Math.min(30, portraitQueue.length)} 人）`
+                  : "本阶段已完成"}
+            </button>
+          </article>
+
+          <article className={`review-stage-card ${batchCount ? "active" : "waiting"}`}>
+            <span className="review-stage-number">2</span>
+            <div>
+              <small>数据判断</small>
+              <h3>等待数据筛选</h3>
+              <strong>{metricQueue.length} 人</strong>
+              <p>{batchCount ? `本次将筛选前 ${batchCount} 人。` : "需先完成画像，当前没有可筛选达人。"}</p>
+            </div>
+            <button disabled={!batchCount || isBusy} onClick={reviewAll} type="button">
+              {batchProgress?.stage === "metrics"
+                ? `正在数据筛选 ${batchProgress.completed}/${batchProgress.total}`
+                : batchCount
+                  ? `开始数据筛选（${batchCount} 人）`
+                  : "等待画像完成"}
+            </button>
+          </article>
+
+          <article className="review-stage-card result">
+            <span className="review-stage-number">3</span>
+            <div>
+              <small>本轮结果</small>
+              <h3>自动分流入库</h3>
+              <div className="review-result-counts">
+                <span><b>{runSummary.featured}</b>精选库</span>
+                <span><b>{runSummary.candidate}</b>待选库</span>
+                <span><b>{runSummary.excluded}</b>未通过 / 待重试</span>
+              </div>
+              <p>画像通过进入待选库，数据达标进入精选库。</p>
+            </div>
+          </article>
+        </div>
+
+        <details className="review-rules-details">
+          <summary>
+            <span><strong>查看精选标准</strong><small>{selectedRuleLabels}</small></span>
+            <b>展开设置</b>
+          </summary>
         <div className="review-rule-console">
           <div className="review-rule-toolbar">
             <div>
@@ -389,24 +565,24 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
               <span className="review-switch active" aria-hidden="true"><i /></span>
               <span>已开启</span>
             </div>
-            <span>指标已经在 AI 画像阶段记录，本阶段不再抓取作品。</span>
+            <span>{isDouyinTask ? "抖音精选执行强制门槛；指标来自画像阶段，本阶段不重复抓取。" : "指标已经在 AI 画像阶段记录，本阶段不再抓取作品。"}</span>
           </div>
 
           <div className="topic-list review-metric-grid">
           <label className={`review-metric-card ${rules.requireAvgLikes500 ? "selected" : ""}`}>
-            <input checked={Boolean(rules.requireAvgLikes500)} onChange={() => toggleRule("requireAvgLikes500")} type="checkbox" />
+            <input checked={Boolean(rules.requireAvgLikes500)} disabled={isDouyinTask} onChange={() => toggleRule("requireAvgLikes500")} type="checkbox" />
             <span>平均点赞</span>
             <input min={0} onChange={(event) => setNumberRule("avgLikesThreshold", Number(event.target.value))} type="number" value={rules.avgLikesThreshold || 500} />
           </label>
           <label className={`review-metric-card wide ${rules.requireViral2000 ? "selected" : ""}`}>
-            <input checked={Boolean(rules.requireViral2000)} onChange={() => toggleRule("requireViral2000")} type="checkbox" />
+            <input checked={Boolean(rules.requireViral2000)} disabled={isDouyinTask} onChange={() => toggleRule("requireViral2000")} type="checkbox" />
             <span>爆款作品</span>
             <input min={1} onChange={(event) => setNumberRule("minViralWorks", Number(event.target.value))} type="number" value={rules.minViralWorks || 1} />
             <em>条，点赞 ≥</em>
             <input min={0} onChange={(event) => setNumberRule("viralLikesThreshold", Number(event.target.value))} type="number" value={rules.viralLikesThreshold || 2000} />
           </label>
           <label className={`review-metric-card ${rules.requireWorkCount10 ? "selected" : ""}`}>
-            <input checked={Boolean(rules.requireWorkCount10)} onChange={() => toggleRule("requireWorkCount10")} type="checkbox" />
+            <input checked={Boolean(rules.requireWorkCount10)} disabled={isDouyinTask} onChange={() => toggleRule("requireWorkCount10")} type="checkbox" />
             <span>主页样本数</span>
             <input min={1} onChange={(event) => setNumberRule("minSampleWorks", Number(event.target.value))} type="number" value={rules.minSampleWorks || 10} />
           </label>
@@ -415,7 +591,7 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
             <span>爆款作品在近 1 个月内</span>
           </label>
           <label className={`review-metric-card compact ${rules.requireRecentUpdate ? "selected" : ""}`}>
-            <input checked={Boolean(rules.requireRecentUpdate)} onChange={() => toggleRule("requireRecentUpdate")} type="checkbox" />
+            <input checked={Boolean(rules.requireRecentUpdate)} disabled={isDouyinTask} onChange={() => toggleRule("requireRecentUpdate")} type="checkbox" />
             <span>近 1 个月有更新</span>
           </label>
           </div>
@@ -428,6 +604,7 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
             <label>
               <span>多项门槛逻辑</span>
               <select
+                disabled={isDouyinTask}
                 onChange={(event) => setRules((current) => ({ ...current, metricMatchMode: event.target.value === "any" ? "any" : "all" }))}
                 value={rules.metricMatchMode || "all"}
               >
@@ -441,20 +618,22 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
             </div>
           </div>
 
-          <p className="review-rule-tip">数据门槛只校验画像阶段记录的指标；建议先完成主页样本和 AI 画像，再批量应用门槛。</p>
+          <p className="review-rule-tip">{isDouyinTask ? "抖音达人必须同时满足：平均点赞、爆款作品、至少 10 条主页样本、近 1 个月有更新；未全部通过的一律留在待选库。" : "数据门槛只校验画像阶段记录的指标；建议先完成主页样本和 AI 画像，再批量应用门槛。"}</p>
         </div>
+        </details>
       </section>
 
-      <section className="panel workflow-section workflow-results-section">
-        <div className="panel-header">
+      <details className="panel workflow-section workflow-results-section review-queue-details">
+        <summary className="panel-header">
           <div>
             <span className="workflow-kicker">03 · 待处理达人</span>
-            <h2>样本与数据筛选队列</h2>
+            <h2>待处理达人队列</h2>
             <p>
-              待补齐/画像 {portraitQueue.length} 个，画像通过待选 {metricQueue.length} 个，数据门槛队列 {batchCount} 个；{batchModeText}。
+              等待生成画像 {portraitQueue.length} 人　·　等待数据筛选 {metricQueue.length} 人　·　本次可处理 {batchCount} 人
             </p>
           </div>
-        </div>
+          <b className="review-queue-toggle">展开查看</b>
+        </summary>
 
         {creators.length ? (
           <div className="candidate-grid">
@@ -502,7 +681,7 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
 
                   {creator.poolStatus === "pending_review" ? (
                     <button disabled={isBusy} onClick={() => void profileCreators([creator])} type="button">
-                      补齐主页样本并 AI 画像
+                      生成内容画像
                     </button>
                   ) : (
                     <button disabled={isBusy} onClick={() => reviewCreator(creator)} type="button">
@@ -527,7 +706,7 @@ export function ReviewClient({ initialCreators, initialBrandLibraries, initialCa
               ))}
           </div>
         ) : null}
-      </section>
+      </details>
     </div>
   );
 }

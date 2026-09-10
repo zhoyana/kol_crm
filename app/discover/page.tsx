@@ -15,7 +15,7 @@ export default async function DiscoverPage() {
             <p>输入关键词，从采集结果里筛出内容初筛通过的作者，先加入待复筛池。</p>
           </div>
           <Link className="button-link" href="/review">
-            去达人复筛
+            去画像与复筛
           </Link>
         </header>
 

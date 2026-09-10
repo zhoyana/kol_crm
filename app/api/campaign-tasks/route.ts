@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   createCampaignTask,
+  deleteCampaignTask,
   getBrandLibraries,
   getCampaignTasks,
   normalizeCampaignTaskInput,
@@ -40,5 +41,20 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "创建品类任务失败。";
     return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  const body = await request.json().catch(() => null);
+  const id = Number(body?.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return NextResponse.json({ error: "无效的品类任务。" }, { status: 400 });
+
+  try {
+    const task = await deleteCampaignTask(id);
+    return NextResponse.json({ ok: true, task });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "删除任务失败。";
+    const status = message.includes("正在执行") ? 409 : message.includes("不存在") ? 404 : 500;
+    return NextResponse.json({ error: message }, { status });
   }
 }

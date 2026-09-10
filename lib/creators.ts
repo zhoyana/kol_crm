@@ -23,12 +23,11 @@ export type Creator = {
   poolStatus: CreatorPoolStatus;
   screeningStatus: string;
   screeningSummary: string;
+  poolUpdatedAt?: string;
   avgPlay: number;
   stablePlay: number;
   currentCpm: number | null;
   suggestedPrice: number;
-  grade: "S" | "A" | "B" | "C" | "D";
-  priority: "high" | "medium" | "low";
 };
 
 export type OutreachTask = {
@@ -67,27 +66,12 @@ function median(values: number[]): number {
   return Math.round((sorted[middle - 1] + sorted[middle]) / 2);
 }
 
-function gradeCreator(fans: number, stablePlay: number, currentCpm: number | null): Creator["grade"] {
-  const playFanRatio = fans > 0 ? stablePlay / fans : 0;
-  if (playFanRatio >= 3 && stablePlay >= 100000 && (!currentCpm || currentCpm <= 18)) return "S";
-  if (playFanRatio >= 2 && stablePlay >= 50000 && (!currentCpm || currentCpm <= 25)) return "A";
-  if (playFanRatio >= 1 && stablePlay >= 20000) return "B";
-  if (stablePlay >= 5000) return "C";
-  return "D";
-}
-
 function isPending(status: string): boolean {
-  return ["未", "待", "暂无"].some((keyword) => status.includes(keyword));
+  return status !== "已建联";
 }
 
 function isContacted(status: string): boolean {
-  return ["已", "需跟进", "待发送确认", "报价", "确定"].some((keyword) => status.includes(keyword));
-}
-
-function priorityFor(grade: Creator["grade"], outreachStatus: string): Creator["priority"] {
-  if (isPending(outreachStatus) && (grade === "S" || grade === "A")) return "high";
-  if (grade === "S" || grade === "A" || grade === "B") return "medium";
-  return "low";
+  return status === "已建联";
 }
 
 function pick(record: Record<string, string>, keys: string[]): string {
@@ -101,6 +85,11 @@ function pick(record: Record<string, string>, keys: string[]): string {
 function normalizePlays(value: unknown): number[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => numberValue(String(item))).filter((item) => item > 0);
+}
+
+export function normalizeOutreachStatus(value: unknown): "未建联" | "已建联" {
+  const status = String(value || "").trim();
+  return ["已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃", "发送中"].includes(status) ? "已建联" : "未建联";
 }
 
 function buildCreator(input: {
@@ -121,15 +110,16 @@ function buildCreator(input: {
   screeningSummary?: string;
   campaignTaskId?: number | null;
   campaignTaskName?: string;
+  poolUpdatedAt?: string;
 }): Creator {
   const stablePlay = median(input.plays);
   const avgPlay = input.plays.length ? Math.round(input.plays.reduce((sum, item) => sum + item, 0) / input.plays.length) : 0;
   const currentCpm = input.quote && stablePlay ? Number(((input.quote / stablePlay) * 1000).toFixed(1)) : null;
   const suggestedPrice = Math.round((stablePlay / 1000) * 15);
-  const grade = gradeCreator(input.fans, stablePlay, currentCpm);
 
   return {
     ...input,
+    outreachStatus: normalizeOutreachStatus(input.outreachStatus),
     campaignTaskId: input.campaignTaskId || null,
     campaignTaskName: input.campaignTaskName || "",
     poolStatus: input.poolStatus || "candidate",
@@ -138,9 +128,7 @@ function buildCreator(input: {
     avgPlay,
     stablePlay,
     currentCpm,
-    suggestedPrice,
-    grade,
-    priority: priorityFor(grade, input.outreachStatus)
+    suggestedPrice
   };
 }
 
@@ -186,14 +174,15 @@ async function getCreatorsFromDatabase(campaignTaskId?: number | null): Promise<
             fans: row.creator.fans,
             plays: normalizePlays(row.creator.plays),
             quote: row.creator.quote,
-            outreachStatus: row.creator.outreachStatus || "未建联",
+            outreachStatus: row.outreachStatus || "未建联",
             cooperationStatus: row.creator.cooperationStatus || "-",
             category: row.campaignTask?.category || row.creator.category || "未分类",
             contact: row.creator.contact || "-",
             notes: row.notes || row.creator.notes || "",
             poolStatus: row.poolStatus || row.creator.poolStatus || "candidate",
             screeningStatus: row.screeningStatus || row.creator.screeningStatus || "",
-            screeningSummary: row.screeningSummary || row.creator.screeningSummary || ""
+            screeningSummary: row.screeningSummary || row.creator.screeningSummary || "",
+            poolUpdatedAt: row.updatedAt?.toISOString?.() || ""
           })
         );
       }
@@ -223,7 +212,8 @@ async function getCreatorsFromDatabase(campaignTaskId?: number | null): Promise<
           notes: row.notes || "",
           poolStatus: row.poolStatus || "candidate",
           screeningStatus: row.screeningStatus || "",
-          screeningSummary: row.screeningSummary || ""
+          screeningSummary: row.screeningSummary || "",
+          poolUpdatedAt: row.updatedAt?.toISOString?.() || ""
         })
       );
     } finally {
@@ -314,7 +304,7 @@ export function getOutreachTasks(creators: Creator[]): OutreachTask[] {
         creator,
         kind: "initial",
         title: "初次建联",
-        reason: creator.priority === "high" ? "高优先级且尚未联系" : "尚未建立联系",
+        reason: "尚未建立联系",
         action: "发送初次建联话术"
       });
       continue;
@@ -344,10 +334,8 @@ export function getOutreachTasks(creators: Creator[]): OutreachTask[] {
 
   return tasks.sort((a, b) => {
     const kindScore = { initial: 3, negotiate: 2, followup: 1 };
-    const priorityScore = { high: 3, medium: 2, low: 1 };
     return (
       kindScore[b.kind] - kindScore[a.kind] ||
-      priorityScore[b.creator.priority] - priorityScore[a.creator.priority] ||
       b.creator.stablePlay - a.creator.stablePlay
     );
   });
@@ -357,7 +345,7 @@ export function generateOutreachScript(creator: Creator): string {
   const avgPlayText = creator.avgPlay >= 10000 ? `${(creator.avgPlay / 10000).toFixed(1)}万` : `${creator.avgPlay}`;
   const suggestedPriceText = formatNumber(creator.suggestedPrice);
 
-  if (creator.grade === "S" || creator.grade === "A") {
+  if (creator.stablePlay >= 50000) {
     return [
       "您好，我是负责达人合作的小李。",
       `看到您的账号内容质量和数据都比较稳定，平均播放大概 ${avgPlayText}，和我们想合作的方向比较契合。`,

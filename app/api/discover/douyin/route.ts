@@ -2,13 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   applyDiscoveryFilters,
   importDouyinWorksToPool,
+  parseDouyinDiscoveryCandidates,
   searchDouyinCandidatesFromWorkPool,
-  searchDouyinResultFiles,
-  searchDouyinResultFilesByTask,
+  type DouyinDiscoveryCandidate,
   type DiscoveryFilterOptions
 } from "@/lib/douyin-import";
 import { filterCandidatesByAiWorkTitles } from "@/lib/ai-work-title-filter";
-import { getDouyinCrawlerTask } from "@/lib/crawler-tasks";
+import { getDouyinCrawlerTask, getDouyinCrawlerTaskResult } from "@/lib/crawler-tasks";
 import { prisma } from "@/lib/prisma";
 
 type DiscoveryStats = {
@@ -17,7 +17,7 @@ type DiscoveryStats = {
   newCandidateCount: number;
 };
 
-async function prepareCandidates(keyword: string, rawCandidates: Awaited<ReturnType<typeof searchDouyinResultFiles>>["candidates"], filters: DiscoveryFilterOptions) {
+async function prepareCandidates(keyword: string, rawCandidates: DouyinDiscoveryCandidate[], filters: DiscoveryFilterOptions) {
   const titleFiltered = filters.useAiWorkFilter ? await filterCandidatesByAiWorkTitles(keyword, rawCandidates, filters) : rawCandidates;
   const candidates = applyDiscoveryFilters(titleFiltered, keyword, {
     ...filters,
@@ -44,7 +44,7 @@ function secUidFromProfileUrl(profileUrl: string | null | undefined): string {
   return profileUrl.split("/user/")[1]?.split("?")[0] || "";
 }
 
-function candidateKeys(candidate: Awaited<ReturnType<typeof searchDouyinResultFiles>>["candidates"][number]): string[] {
+function candidateKeys(candidate: DouyinDiscoveryCandidate): string[] {
   return [
     candidate.externalId,
     candidate.creatorId,
@@ -58,8 +58,8 @@ function candidateKeys(candidate: Awaited<ReturnType<typeof searchDouyinResultFi
 }
 
 async function hideExistingCreators(
-  candidates: Awaited<ReturnType<typeof searchDouyinResultFiles>>["candidates"]
-): Promise<{ candidates: Awaited<ReturnType<typeof searchDouyinResultFiles>>["candidates"]; stats: DiscoveryStats }> {
+  candidates: DouyinDiscoveryCandidate[]
+): Promise<{ candidates: DouyinDiscoveryCandidate[]; stats: DiscoveryStats }> {
   const emptyStats = {
     rawCandidateCount: candidates.length,
     hiddenExistingCount: 0,
@@ -111,15 +111,13 @@ export async function POST(request: NextRequest) {
     const body = (await request.json().catch(() => null)) as { keyword?: string; filters?: DiscoveryFilterOptions } | null;
     const keyword = body?.keyword?.trim() || "";
     const filters = body?.filters || {};
-    const task = getDouyinCrawlerTask();
+    const task = await getDouyinCrawlerTask();
     const shouldUseTaskData =
       task.startedAt && task.keyword && task.keyword.trim().toLowerCase() === keyword.trim().toLowerCase() && task.status !== "idle";
     if (shouldUseTaskData) {
-      const { candidates: rawCandidates, sourceFiles } = await searchDouyinResultFilesByTask({
-        keyword,
-        startedAt: task.startedAt,
-        activeKeywords: task.activeKeywords
-      });
+      const localResult = await getDouyinCrawlerTaskResult();
+      const rawCandidates = parseDouyinDiscoveryCandidates(localResult.content, keyword);
+      const sourceFiles = [`local-agent://douyin/discovery/${task.id}`];
       const candidates = await prepareCandidates(keyword, rawCandidates, filters);
       await importDouyinWorksToPool(candidates);
       const deduped = await hideExistingCreators(candidates);
@@ -147,18 +145,13 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const { candidates: rawCandidates, sourceFiles } = await searchDouyinResultFiles(keyword);
-    const candidates = await prepareCandidates(keyword, rawCandidates, filters);
-    await importDouyinWorksToPool(candidates);
-    const deduped = await hideExistingCreators(candidates);
-
     return NextResponse.json({
       keyword,
-      candidates: deduped.candidates,
-      sourceFiles,
-      total: deduped.candidates.length,
-      stats: deduped.stats,
-      source: "legacy_jsonl"
+      candidates: [],
+      sourceFiles: [],
+      total: 0,
+      stats: { rawCandidateCount: 0, hiddenExistingCount: 0, newCandidateCount: 0 },
+      source: "empty"
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";

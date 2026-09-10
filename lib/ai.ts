@@ -4,7 +4,6 @@ import { buildShushujiaOutreachGuide } from "./brand-outreach-style";
 
 export type AiEvaluationResult = {
   matchScore: number;
-  grade: "S" | "A" | "B" | "C" | "D";
   recommendedAction: string;
   suggestedCooperation: string;
   riskTags: string[];
@@ -22,15 +21,14 @@ type ApiConfig = {
 
 function fallbackEvaluation(creator: Creator): AiEvaluationResult {
   const isExpensive = creator.currentCpm != null && creator.currentCpm > 20;
-  const score = creator.grade === "S" ? 88 : creator.grade === "A" ? 80 : creator.grade === "B" ? 68 : 52;
+  const score = creator.stablePlay >= 100000 ? 88 : creator.stablePlay >= 50000 ? 80 : creator.stablePlay >= 20000 ? 68 : 52;
 
   return {
     matchScore: score,
-    grade: creator.grade,
-    recommendedAction: creator.priority === "high" ? "优先建联" : creator.priority === "medium" ? "观察后建联" : "暂缓",
+    recommendedAction: creator.poolStatus === "featured" ? "建议建联" : creator.poolStatus === "candidate" ? "可进入建联验证" : "暂缓",
     suggestedCooperation: creator.stablePlay > 100000 ? "轻量内容合作 / 场景化植入" : "轻量内容合作 / 询价测试",
     riskTags: isExpensive ? ["报价偏高"] : creator.stablePlay === 0 ? ["播放数据不足"] : [],
-    reason: `该达人稳定播放约 ${formatNumber(creator.stablePlay)}，当前评级为 ${creator.grade}。${
+    reason: `该达人稳定播放约 ${formatNumber(creator.stablePlay)}。${
       isExpensive ? "当前 CPM 高于目标 CPM 15，建议先谈价。" : "数据可以进入建联验证。"
     }`,
     negotiationPoint: `建议以 ¥${formatNumber(creator.suggestedPrice)} 作为谈价锚点，围绕稳定播放量和目标 CPM 15 沟通。`,
@@ -61,14 +59,12 @@ function normalizeEvaluation(value: unknown, creator: Creator): AiEvaluationResu
   const fallback = fallbackEvaluation(creator);
   const data = value as Partial<AiEvaluationResult>;
   const riskTags = Array.isArray(data.riskTags) ? data.riskTags.map(String) : fallback.riskTags;
-  const grade = ["S", "A", "B", "C", "D"].includes(String(data.grade)) ? (data.grade as AiEvaluationResult["grade"]) : fallback.grade;
   const outreachScript = String(data.outreachScript || "").trim();
 
   if (!outreachScript) return fallback;
 
   return {
     matchScore: Math.max(0, Math.min(100, Number(data.matchScore ?? fallback.matchScore))),
-    grade,
     recommendedAction: String(data.recommendedAction ?? fallback.recommendedAction),
     suggestedCooperation: String(data.suggestedCooperation ?? fallback.suggestedCooperation),
     riskTags,
@@ -140,7 +136,7 @@ function creatorPortrait(creator: Creator): string {
     `账号：${creator.name}`,
     `库类型：${poolStatusText(creator.poolStatus)}`,
     `类目/标签：${creator.category || "未分类"}`,
-    `数据：粉丝 ${formatNumber(creator.fans)}，稳定播放 ${formatNumber(creator.stablePlay)}，建议报价 ¥${formatNumber(creator.suggestedPrice)}，评级 ${creator.grade}`,
+    `数据：粉丝 ${formatNumber(creator.fans)}，稳定播放 ${formatNumber(creator.stablePlay)}，建议报价 ¥${formatNumber(creator.suggestedPrice)}`,
     summaryLines.length ? `复筛画像：${summaryLines.join("；")}` : "",
     creator.notes ? `备注：${cleanText(creator.notes)}` : "",
     `可用切入点：${anchors.join("、")}`
@@ -173,7 +169,6 @@ export async function evaluateCreatorWithAi(creator: Creator): Promise<AiEvaluat
       quote: creator.quote,
       currentCpm: creator.currentCpm,
       suggestedPrice: creator.suggestedPrice,
-      grade: creator.grade,
       outreachStatus: creator.outreachStatus,
       portrait: creatorPortrait(creator),
       personalAnchors: inferPersonalAnchors(creator)
@@ -195,7 +190,7 @@ export async function evaluateCreatorWithAi(creator: Creator): Promise<AiEvaluat
           {
             role: "system",
             content:
-              "你是蜀黍家的品牌商务，负责判断达人合作价值，并生成自然短私信。必须只输出可解析 JSON，不要 Markdown。字段包括 matchScore, grade, recommendedAction, suggestedCooperation, riskTags, reason, negotiationPoint, outreachScript。"
+              "你是蜀黍家的品牌商务，负责判断达人合作价值，并生成自然短私信。必须只输出可解析 JSON，不要 Markdown。字段包括 matchScore, recommendedAction, suggestedCooperation, riskTags, reason, negotiationPoint, outreachScript。"
           },
           {
             role: "user",

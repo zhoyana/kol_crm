@@ -13,6 +13,7 @@ export type CampaignTaskItem = {
   productSellingPoints: string[];
   outreachTone: string;
   status: string;
+  platform: string;
   ruleProfileId: number | null;
   brandLibraryId: number | null;
   brandLibrary: BrandLibraryItem | null;
@@ -44,6 +45,7 @@ export type CampaignTaskInput = {
   productSellingPoints?: string[];
   outreachTone?: string;
   status?: string;
+  platform?: string;
   ruleProfileId?: number | null;
   brandLibraryId?: number | null;
   /** 绑定的固定达人模板（品牌 → 人群模板 → 任务）。设置后核心筛选规则由模板决定 */
@@ -97,6 +99,7 @@ function toCampaignTask(row: any): CampaignTaskItem {
     productSellingPoints: asStringArray(row.productSellingPoints),
     outreachTone: row.outreachTone || "",
     status: row.status || "active",
+    platform: row.platform || "抖音",
     ruleProfileId: row.ruleProfileId || null,
     brandLibraryId: row.brandLibraryId || null,
     audienceTemplateId: row.audienceTemplateId || null,
@@ -139,6 +142,7 @@ export function normalizeCampaignTaskInput(input: any): CampaignTaskInput {
     productSellingPoints: cleanList(input?.productSellingPoints),
     outreachTone: String(input?.outreachTone || "").trim(),
     status: String(input?.status || "active").trim() || "active",
+    platform: input?.platform ? String(input.platform).trim() : undefined,
     ruleProfileId: input?.ruleProfileId ? Number(input.ruleProfileId) : null,
     brandLibraryId: input?.brandLibraryId ? Number(input.brandLibraryId) : null,
     audienceTemplateId: input?.audienceTemplateId ? Number(input.audienceTemplateId) : null,
@@ -280,6 +284,7 @@ export async function createCampaignTask(input: CampaignTaskInput): Promise<Camp
         productSellingPoints: input.productSellingPoints || [],
         outreachTone: input.outreachTone || null,
         status: input.status || "active",
+        platform: input.platform || "抖音",
         ruleProfileId: input.ruleProfileId || null,
         brandLibraryId: input.brandLibraryId || null,
         audienceTemplateId: overrides.audienceTemplateId,
@@ -314,4 +319,25 @@ export async function updateCampaignTaskAgentGoal(id: number, value: unknown): P
   } finally {
     // prisma singleton — do not disconnect
   }
+}
+
+export async function deleteCampaignTask(id: number): Promise<{ id: number; name: string }> {
+  const prisma = prismaSingleton;
+  const task = await prisma.campaignTask.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      name: true,
+      agentRuns: {
+        where: { status: { in: ["queued", "running", "retrying", "paused"] } },
+        select: { id: true },
+        take: 1
+      }
+    }
+  });
+  if (!task) throw new Error("任务不存在或已被删除。");
+  if (task.agentRuns.length) throw new Error("该任务仍有正在执行的流程，请先停止流程后再删除。");
+
+  await prisma.campaignTask.delete({ where: { id } });
+  return { id: task.id, name: task.name };
 }

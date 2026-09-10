@@ -1,14 +1,15 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
 import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 import type { CampaignTaskSummary } from "@/lib/agent-workbench";
 import { AgentPipelineDashboard } from "./AgentPipelineDashboard";
+import { AgentEvaluationPanel } from "./AgentEvaluationPanel";
 
 type CampaignTaskDraft = {
   brandLibraryId: string;
+  platform: string;
   name: string;
   productName: string;
   category: string;
@@ -19,6 +20,8 @@ type CampaignTaskDraft = {
   productSellingPoints: string;
   outreachTone: string;
 };
+
+const PLATFORMS = ["抖音"] as const;
 
 type AudienceTemplateSummary = {
   id: number;
@@ -43,6 +46,7 @@ type AudienceTemplateSummary = {
 
 const defaultCampaignTask: CampaignTaskDraft = {
   brandLibraryId: "",
+  platform: "抖音",
   name: "",
   productName: "",
   category: "",
@@ -105,7 +109,9 @@ export function AgentClient({
   );
   const [taskDraft, setTaskDraft] = useState({ ...defaultCampaignTask, brandLibraryId: initialBrandLibraries[0]?.id ? String(initialBrandLibraries[0].id) : "" });
   const [taskSaving, setTaskSaving] = useState(false);
-  const [message, setMessage] = useState("");
+  const [deletingTaskId, setDeletingTaskId] = useState<number | null>(null);
+  const [taskDeleteError, setTaskDeleteError] = useState("");
+  const [, setMessage] = useState("");
 
   // 选品牌后自动加载对应的固定达人模板；命中后核心筛选规则锁定，仅允许补充少量关键词
   const [audienceTemplate, setAudienceTemplate] = useState<AudienceTemplateSummary | null>(null);
@@ -176,6 +182,7 @@ export function AgentClient({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           brandLibraryId: Number(taskDraft.brandLibraryId) || null,
+          platform: taskDraft.platform,
           name: taskDraft.name,
           productName: taskDraft.productName,
           category: taskDraft.category,
@@ -208,6 +215,36 @@ export function AgentClient({
     }
   }
 
+  async function deleteTask(task: CampaignTaskItem) {
+    const confirmed = window.confirm(
+      `确定删除任务「${task.name}」吗？\n\n达人本身会保留，但会解除与该任务的关联；该任务的历史运行记录也会一并删除。`
+    );
+    if (!confirmed) return;
+
+    setDeletingTaskId(task.id);
+    setTaskDeleteError("");
+    try {
+      const response = await fetch("/api/campaign-tasks", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: task.id })
+      });
+      const data = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(data.error || "删除任务失败。");
+
+      const remainingTasks = campaignTasks.filter((item) => item.id !== task.id);
+      setCampaignTasks(remainingTasks);
+      setSummaries((items) => items.filter((item) => item.campaignTaskId !== task.id));
+      if (String(task.id) === selectedCampaignTaskId) {
+        setSelectedCampaignTaskId(remainingTasks[0]?.id ? String(remainingTasks[0].id) : "");
+      }
+    } catch (error) {
+      setTaskDeleteError(error instanceof Error ? error.message : "删除任务失败。");
+    } finally {
+      setDeletingTaskId(null);
+    }
+  }
+
   return (
     <div className="agent-stack">
       <section className="panel agent-panel agent-current-task-panel">
@@ -223,33 +260,8 @@ export function AgentClient({
           </label>
         </div>
 
-        <div className="agent-workbench-grid">
-          {selectedTask && selectedSummary ? (
-            <>
-              <div className="agent-task-info">
-                <span className="agent-product-tag">{selectedTask.productName}</span>
-                <h3>{selectedTask.name}</h3>
-                <strong>{selectedTask.targetAudience}</strong>
-                <p>{selectedTask.targetDescription}</p>
-              </div>
-
-              <div className="agent-suggestion">
-                <span>Agent 下一步建议</span>
-                <strong>{selectedSummary.recommendation.title}</strong>
-                <p>{selectedSummary.recommendation.reason}</p>
-                <Link className="button-link" href={selectedSummary.recommendation.primaryHref}>
-                  {selectedSummary.recommendation.primaryAction}
-                </Link>
-              </div>
-            </>
-          ) : (
-            <p className="empty-state">先保存一个品类任务，Agent 工作台才知道围绕什么目标推进。</p>
-          )}
-        </div>
-
         {selectedSummary ? (
-          <>
-            <div className="agent-rule-meta">
+          <div className="agent-rule-meta">
               <div>
                 <span>待补样本/画像</span>
                 <strong>{selectedSummary.counts.pendingReview}</strong>
@@ -274,15 +286,7 @@ export function AgentClient({
                 <span>精选已建联</span>
                 <strong>{selectedSummary.counts.contacted}</strong>
               </div>
-            </div>
-
-            <div className="workflow-actions">
-              <Link href={selectedSummary.links.discover}>1. 达人发现</Link>
-              <Link href={selectedSummary.links.review}>2. 样本与数据筛选</Link>
-              <Link href={selectedSummary.links.creators}>3. 达人库</Link>
-              <Link href={selectedSummary.links.tasks}>4. 建联任务</Link>
-            </div>
-          </>
+          </div>
         ) : null}
       </section>
 
@@ -295,10 +299,12 @@ export function AgentClient({
         />
       ) : null}
 
+      <AgentEvaluationPanel campaignTaskId={selectedTask?.id ?? null} />
+
       <section className="panel agent-panel agent-task-management-panel">
         <div className="panel-header">
           <div>
-            <span className="agent-section-kicker">03 · 任务管理</span>
+            <span className="agent-section-kicker">04 · 任务管理</span>
             <h2>任务管理</h2>
             <p>新建任务，或点选已有任务设为当前推进目标。</p>
           </div>
@@ -319,6 +325,13 @@ export function AgentClient({
             <span>所属品牌库</span>
             <select value={taskDraft.brandLibraryId} onChange={(event) => updateTaskDraft("brandLibraryId", event.target.value)}>
               {initialBrandLibraries.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+            </select>
+          </label>
+
+          <label>
+            <span>投放平台</span>
+            <select value={taskDraft.platform} onChange={(event) => updateTaskDraft("platform", event.target.value)}>
+              {PLATFORMS.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </label>
 
@@ -453,12 +466,16 @@ export function AgentClient({
             </button>
           </div>
         </details>
-        <div className="agent-existing-tasks-inner">
-          <div className="agent-existing-head">
-            <span className="agent-section-kicker">已有任务</span>
-            <h3>已有任务</h3>
-          </div>
+        <details className="agent-existing-tasks-inner">
+          <summary className="agent-existing-head">
+            <span>
+              <strong>已有任务</strong>
+              <small>{campaignTasks.length} 个任务{selectedTask ? ` · 当前：${selectedTask.name}` : ""}</small>
+            </span>
+            <b>展开查看</b>
+          </summary>
           <div className="campaign-task-list">
+            {taskDeleteError ? <p className="form-error campaign-task-delete-error">{taskDeleteError}</p> : null}
             {campaignTasks.length === 0 ? (
               <p className="empty-state">还没有任务。先保存一个，再去达人发现页开始测试。</p>
             ) : (
@@ -493,13 +510,26 @@ export function AgentClient({
                         <dd>{task.seedKeywords.slice(0, 8).join("，") || "-"}</dd>
                       </div>
                     </dl>
-                    {isCurrent ? <span className="agent-current-badge">当前任务</span> : null}
+                    <div className="campaign-task-card-actions">
+                      {isCurrent ? <span className="agent-current-badge">当前任务</span> : null}
+                      <button
+                        className="campaign-task-delete-button"
+                        disabled={deletingTaskId === task.id}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteTask(task);
+                        }}
+                        type="button"
+                      >
+                        {deletingTaskId === task.id ? "删除中…" : "删除任务"}
+                      </button>
+                    </div>
                   </article>
                 );
               })
             )}
           </div>
-        </div>
+        </details>
       </section>
     </div>
   );

@@ -1,7 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 
 const globalForCdp = globalThis as typeof globalThis & {
@@ -21,7 +20,14 @@ function debugPort(): number {
 }
 
 function userDataDir(): string {
-  return process.env.CDP_USER_DATA_DIR || path.join(os.homedir(), "Desktop", "chrome-cdp");
+  // Keep local development and the portable Agent on the same isolated Chrome
+  // profile. The legacy Desktop/chrome-cdp profile can be captured by a stale
+  // background Chrome process, causing new launches to exit without opening a
+  // window or listening on 9222.
+  // PortableAgentLauncher explicitly sets CDP_USER_DATA_DIR to LocalAppData.
+  // Source/dev runs use the project runtime directory, which remains writable
+  // under the managed local development process.
+  return process.env.CDP_USER_DATA_DIR || path.join(process.cwd(), ".runtime", "chrome-profile-douyin");
 }
 
 function chromePath(): string {
@@ -47,6 +53,23 @@ function chromePath(): string {
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ensureVisibleCdpPage(port: number): Promise<void> {
+  const listResponse = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(3_000)
+  });
+  if (!listResponse.ok) throw new Error(`CDP 页面列表 HTTP ${listResponse.status}`);
+  const targets = await listResponse.json() as Array<{ type?: string; url?: string }>;
+  const hasUsablePage = targets.some((target) => target.type === "page" && Boolean(target.url?.trim()));
+  if (hasUsablePage) return;
+
+  const targetUrl = "https://www.douyin.com/";
+  const createResponse = await fetch(
+    `http://127.0.0.1:${port}/json/new?${encodeURIComponent(targetUrl)}`,
+    { method: "PUT", signal: AbortSignal.timeout(5_000) }
+  );
+  if (!createResponse.ok) throw new Error(`CDP 创建可见页面 HTTP ${createResponse.status}`);
 }
 
 function execFileText(file: string, args: string[]): Promise<string> {
@@ -117,6 +140,26 @@ async function waitForPortState(port: number, available: boolean, timeoutMs: num
   return false;
 }
 
+function isPidAlive(pid: number | null): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidExit(pid: number | null, timeoutMs: number): Promise<boolean> {
+  if (!pid) return true;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await wait(300);
+  }
+  return !isPidAlive(pid);
+}
+
 export function isCdpBrowserAvailable(port = debugPort(), timeoutMs = 800): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host: "127.0.0.1", port });
@@ -134,13 +177,12 @@ export function isCdpBrowserAvailable(port = debugPort(), timeoutMs = 800): Prom
   });
 }
 
-async function startOrReuseCdpBrowser(): Promise<CdpBrowserStatus> {
-  const port = debugPort();
+async function startOrReuseCdpBrowser(options?: { port?: number; userDataDir?: string; startUrl?: string }): Promise<CdpBrowserStatus> {
+  const port = options?.port || debugPort();
   const browserPath = chromePath();
-  const profileDir = userDataDir();
-  if (await isCdpBrowserAvailable(port)) {
-    return { port, started: false, chromePath: browserPath, userDataDir: profileDir };
-  }
+  const profileDir = options?.userDataDir || userDataDir();
+  const startUrl = options?.startUrl || "https://www.douyin.com/";
+  if (await isCdpBrowserAvailable(port)) return { port, started: false, chromePath: browserPath, userDataDir: profileDir };
 
   mkdirSync(profileDir, { recursive: true });
   const browser = spawn(
@@ -150,7 +192,10 @@ async function startOrReuseCdpBrowser(): Promise<CdpBrowserStatus> {
       "--remote-debugging-address=127.0.0.1",
       `--user-data-dir=${profileDir}`,
       "--no-first-run",
-      "--no-default-browser-check"
+      "--no-default-browser-check",
+      "--new-window",
+      "--start-maximized",
+      startUrl
     ],
     {
       detached: true,
@@ -180,11 +225,16 @@ export async function ensureCdpBrowser(): Promise<CdpBrowserStatus> {
   return globalForCdp.__kolCrmCdpBrowserPromise;
 }
 
+export async function ensurePlatformCdpBrowser(options: { port: number; userDataDir: string; startUrl: string }): Promise<CdpBrowserStatus> {
+  return startOrReuseCdpBrowser(options);
+}
+
 export async function restartCdpBrowser(): Promise<CdpBrowserStatus> {
   const port = debugPort();
   globalForCdp.__kolCrmCdpBrowserPromise = undefined;
 
   if (await isCdpBrowserAvailable(port)) {
+    const previousPid = await findListeningPid(port);
     try {
       await closeBrowserViaCdp(port);
     } catch (error) {
@@ -192,15 +242,23 @@ export async function restartCdpBrowser(): Promise<CdpBrowserStatus> {
     }
 
     if (!(await waitForPortState(port, false, 8_000))) {
-      const pid = await findListeningPid(port);
+      const pid = (await findListeningPid(port)) || previousPid;
       if (!pid) throw new Error(`无法确定占用 ${port} 端口的 Chrome 进程，未执行强制重启。`);
       await execFileText("taskkill.exe", ["/PID", String(pid), "/T", "/F"]);
       if (!(await waitForPortState(port, false, 8_000))) {
         throw new Error(`已终止占用 ${port} 端口的进程，但端口仍未释放。`);
       }
     }
+
+    // 端口会早于 Chrome 主进程及用户目录锁释放。若此时立即用相同
+    // user-data-dir 启动，新请求会被转发给正在退出的旧实例，随后自身
+    // 退出，最终表现为 9222 一直没有就绪。
+    if (!(await waitForPidExit(previousPid, 8_000)) && previousPid) {
+      await execFileText("taskkill.exe", ["/PID", String(previousPid), "/T", "/F"]).catch(() => "");
+      await waitForPidExit(previousPid, 8_000);
+    }
   }
 
-  await wait(1_000);
+  await wait(2_000);
   return startOrReuseCdpBrowser();
 }

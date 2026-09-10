@@ -2,20 +2,28 @@
   "name": "kol-crm-next",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
+    "dev:local": "node --env-file=.env scripts/start-local-dev.mjs",
     "build": "next build",
     "start": "next start",
+    "local-agent": "node --env-file=.env --experimental-strip-types local-agent/server.mjs",
+    "agent:package": "node scripts/build-portable-agent.mjs",
+    "server:package": "node scripts/build-server-package.mjs",
     "worker": "node --env-file=.env --experimental-strip-types worker/agent-worker.mjs",
     "lint": "next lint",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:seed": "node --env-file=.env scripts/seed-mysql.mjs",
     "db:seed-brands": "node --env-file=.env scripts/seed-audience-templates.mjs",
-    "db:fix-brands": "node --env-file=.env scripts/fix-brand-consolidation.mjs"
+    "db:fix-brands": "node --env-file=.env scripts/fix-brand-consolidation.mjs",
+    "db:migrate-outreach-status": "node --env-file=.env scripts/migrate-binary-outreach-status.mjs",
+    "db:reconcile-pool-stages": "node --env-file=.env scripts/reconcile-creator-pool-stages.mjs"
   },
   "dependencies": {
     "@prisma/client": "^6.0.0",
+    "exceljs": "^4.4.0",
     "next": "^15.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

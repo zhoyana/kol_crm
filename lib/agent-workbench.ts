@@ -36,9 +36,7 @@ function taskLinks(campaignTaskId: number) {
 }
 
 function isUncontacted(status: unknown) {
-  const text = String(status || "").trim();
-  if (!text) return true;
-  return text.includes("未建联") || text.includes("待发送") || text.includes("暂无") || text.includes("未联系");
+  return String(status || "").trim() !== "已建联";
 }
 
 function buildRecommendation(campaignTaskId: number, counts: CampaignTaskSummary["counts"]) {

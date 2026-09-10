@@ -1,10 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { startDouyinCrawlerTask, type DiscoveryMode } from "@/lib/crawler-tasks";
 import type { TopicRuleOptions } from "@/lib/topic-extractor";
+import { agentIdFromRequest } from "@/lib/central-agent-auth";
+import { withLocalAgentDevice } from "@/lib/local-agent-client";
 
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
+  return withLocalAgentDevice(agentIdFromRequest(request), () => handlePost(request));
+}
+
+async function handlePost(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as {
     keyword?: string;
     maxNotes?: number;
@@ -17,7 +23,7 @@ export async function POST(request: NextRequest) {
   } | null;
 
   try {
-    const task = startDouyinCrawlerTask({
+    const task = await startDouyinCrawlerTask({
       keyword: body?.keyword || "",
       maxNotes: body?.maxNotes || 20,
       discoveryMode: body?.discoveryMode || "single",

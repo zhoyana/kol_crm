@@ -9,37 +9,37 @@ datasource db {
 }
 
 model Creator {
-  id                   Int                   @id @default(autoincrement())
-  externalId           String?               @unique
-  name                 String
-  platform             String                @default("抖音")
-  profileUrl           String?
-  category             String?
-  fans                 Int                   @default(0)
-  plays                Json
-  quote                Int?
-  outreachStatus       String                @default("未建联")
-  cooperationStatus    String?
-  contact              String?
-  poolStatus           String                @default("candidate")
-  accountType          String                @default("unknown")
-  rejectReason         String?               @db.Text
-  screeningStatus      String                @default("pending")
-  screeningSummary     String?               @db.Text
-  lastPublishedAt      DateTime?
-  avgLikes             Int                   @default(0)
-  maxLikes             Int                   @default(0)
-  recentWorkCount      Int                   @default(0)
-  viralWorkCount       Int                   @default(0)
-  notes                String?               @db.Text
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @updatedAt
-  outreachLogs         OutreachLog[]
-  aiEvaluations        AiEvaluation[]
-  feedbacks            CreatorFeedback[]
-  works                CreatorWork[]
-  campaignTasks        CreatorCampaignTask[]
-  outreachConversation OutreachConversation?
+  id                Int                   @id @default(autoincrement())
+  externalId        String?               @unique
+  name              String
+  platform          String                @default("抖音")
+  profileUrl        String?
+  category          String?
+  fans              Int                   @default(0)
+  plays             Json
+  quote             Int?
+  outreachStatus    String                @default("未建联")
+  cooperationStatus String?
+  contact           String?
+  poolStatus        String                @default("candidate")
+  accountType       String                @default("unknown")
+  rejectReason      String?               @db.Text
+  screeningStatus   String                @default("pending")
+  screeningSummary  String?               @db.Text
+  lastPublishedAt   DateTime?
+  avgLikes          Int                   @default(0)
+  maxLikes          Int                   @default(0)
+  recentWorkCount   Int                   @default(0)
+  viralWorkCount    Int                   @default(0)
+  notes             String?               @db.Text
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  outreachLogs      OutreachLog[]
+  aiEvaluations     AiEvaluation[]
+  feedbacks         CreatorFeedback[]
+  works             CreatorWork[]
+  campaignTasks     CreatorCampaignTask[]
+  evaluationCases   AgentEvaluationCase[]
 
   @@index([platform])
   @@index([outreachStatus])
@@ -78,104 +78,20 @@ model CreatorWork {
 }
 
 model OutreachLog {
-  id        Int      @id @default(autoincrement())
-  creatorId Int
-  action    String
-  content   String?  @db.Text
-  oldStatus String?
-  newStatus String?
-  createdAt DateTime @default(now())
-
-  creator Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@index([creatorId])
-  @@index([action])
-}
-
-model OutreachConversation {
-  id                Int       @id @default(autoincrement())
-  creatorId         Int       @unique()
-  status            String    @default("waiting_reply")
-  currentStage      String?   @db.Text
-  nextFollowUpAt    DateTime?
-  cooperationResult String?
-  lastPreview       String?   @db.Text
-  lastMessageAt     DateTime?
-  lastInboundAt     DateTime?
-  unreadCount       Int       @default(0)
-  lastSyncedAt      DateTime?
-  syncError         String?   @db.Text
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  creator       Creator                @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  messages      OutreachMessage[]
-  aiSuggestions OutreachAiSuggestion[]
-  feedbacks     OutreachFeedback[]
-
-  @@index([status, lastInboundAt])
-  @@index([unreadCount])
-  @@index([cooperationResult])
-  @@index([nextFollowUpAt])
-}
-
-model OutreachMessage {
-  id             Int       @id @default(autoincrement())
-  conversationId Int
-  fingerprint    String    @unique
-  direction      String
-  content        String    @db.Text
-  sentAt         DateTime?
-  raw            Json?
-  createdAt      DateTime  @default(now())
-
-  conversation OutreachConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-
-  @@index([conversationId, createdAt])
-  @@index([direction])
-}
-
-model OutreachAiSuggestion {
-  id              Int      @id @default(autoincrement())
-  conversationId  Int
-  intent          String
-  intentLabel     String
-  sentiment       String
-  sentimentLabel  String
-  summary         String   @db.Text
-  suggestedAction String   @db.Text
-  draft           String   @db.Text
-  draftReason     String?  @db.Text
-  riskLevel       String   @default("low")
-  source          String   @default("ai")
-  adopted         Boolean?
-  createdAt       DateTime @default(now())
-
-  conversation OutreachConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  feedbacks    OutreachFeedback[]
-
-  @@index([conversationId, createdAt])
-  @@index([intent])
-  @@index([riskLevel])
-}
-
-model OutreachFeedback {
   id             Int      @id @default(autoincrement())
-  conversationId Int
-  suggestionId   Int?
-  verdict        String
-  originalDraft  String?  @db.Text
-  finalContent   String?  @db.Text
-  action         String?
-  note           String?  @db.Text
+  creatorId      Int
+  campaignTaskId Int?
+  action         String
+  content        String?  @db.Text
+  oldStatus      String?
+  newStatus      String?
   createdAt      DateTime @default(now())
 
-  conversation OutreachConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  suggestion   OutreachAiSuggestion? @relation(fields: [suggestionId], references: [id], onDelete: SetNull)
+  creator      Creator       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  campaignTask CampaignTask? @relation(fields: [campaignTaskId], references: [id], onDelete: SetNull)
 
-  @@index([conversationId, createdAt])
-  @@index([suggestionId])
-  @@index([verdict])
+  @@index([creatorId])
+  @@index([campaignTaskId])
   @@index([action])
 }
 
@@ -183,7 +99,6 @@ model AiEvaluation {
   id                   Int      @id @default(autoincrement())
   creatorId            Int
   matchScore           Int
-  grade                String
   recommendedAction    String
   suggestedCooperation String?
   riskTags             Json
@@ -269,6 +184,7 @@ model CampaignTask {
   productSellingPoints       Json
   outreachTone               String?  @db.Text
   status                     String   @default("active")
+  platform                   String   @default("douyin")
   ruleProfileId              Int?
   brandLibraryId             Int?
   audienceTemplateId         Int?     @map("audience_template_id")
@@ -286,13 +202,16 @@ model CampaignTask {
   brandLibrary        BrandLibrary?            @relation(fields: [brandLibraryId], references: [id], onDelete: SetNull)
   audienceTemplate    CreatorAudienceTemplate? @relation(fields: [audienceTemplateId], references: [id], onDelete: SetNull)
   creators            CreatorCampaignTask[]
+  outreachLogs        OutreachLog[]
   agentRuns           AgentRun[]
   videoRevisitTargets VideoRevisitTarget[]
+  evaluationCases     AgentEvaluationCase[]
 
   @@index([category])
   @@index([status])
   @@index([ruleProfileId])
   @@index([brandLibraryId, status])
+  @@index([platform])
   @@index([audienceTemplateId])
 }
 
@@ -321,6 +240,7 @@ model VideoRevisitRecord {
   id           Int      @id @default(autoincrement())
   targetId     Int
   likeCount    Int      @default(0)
+  collectCount Int      @default(0)
   commentCount Int      @default(0)
   revisitedAt  DateTime @default(now())
   rawJson      Json?
@@ -351,6 +271,7 @@ model AgentRun {
   maxDurationMinutes  Int       @default(120)
   maxNoGrowthRounds   Int       @default(2)
   maxRounds           Int       @default(3)
+  metricRules         Json?
   collectedWorks      Int       @default(0)
   aiCalls             Int       @default(0)
   currentRound        Int       @default(1)
@@ -360,6 +281,7 @@ model AgentRun {
   stopReason          String?
   startStage          String    @default("crawling")
   workerId            String?
+  agentDeviceId       String?
   lockedAt            DateTime?
   leaseExpiresAt      DateTime?
   lastHeartbeatAt     DateTime?
@@ -373,7 +295,8 @@ model AgentRun {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  campaignTask CampaignTask    @relation(fields: [campaignTaskId], references: [id], onDelete: Cascade)
+  campaignTask CampaignTask      @relation(fields: [campaignTaskId], references: [id], onDelete: Cascade)
+  agentDevice  LocalAgentDevice? @relation(fields: [agentDeviceId], references: [id], onDelete: SetNull)
   steps        AgentRunStep[]
   rounds       AgentRunRound[]
 
@@ -382,6 +305,43 @@ model AgentRun {
   @@index([stage])
   @@index([status, nextRetryAt, createdAt])
   @@index([leaseExpiresAt])
+  @@index([agentDeviceId])
+}
+
+model LocalAgentDevice {
+  id           String          @id
+  name         String
+  version      String
+  capabilities Json
+  status       String          @default("online")
+  lastSeenAt   DateTime        @default(now())
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  runs         AgentRun[]
+  jobs         LocalAgentJob[]
+
+  @@index([status, lastSeenAt])
+}
+
+model LocalAgentJob {
+  id             String           @id @default(uuid())
+  agentDeviceId  String
+  pathname       String
+  method         String           @default("GET")
+  requestBody    Json?
+  status         String           @default("queued")
+  responseBody   Json?
+  error          String?          @db.Text
+  timeoutMs      Int              @default(300000)
+  claimedAt      DateTime?
+  finishedAt     DateTime?
+  leaseExpiresAt DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  agentDevice    LocalAgentDevice @relation(fields: [agentDeviceId], references: [id], onDelete: Cascade)
+
+  @@index([agentDeviceId, status, createdAt])
+  @@index([status, leaseExpiresAt])
 }
 
 model AgentRunRound {
@@ -474,6 +434,7 @@ model CreatorCampaignTask {
   creatorId        Int
   campaignTaskId   Int
   poolStatus       String   @default("pending_review")
+  outreachStatus   String   @default("未建联")
   screeningStatus  String   @default("pending")
   fitScore         Int      @default(0)
   portrait         String?  @db.Text
@@ -487,6 +448,7 @@ model CreatorCampaignTask {
 
   @@unique([creatorId, campaignTaskId])
   @@index([campaignTaskId])
+  @@index([campaignTaskId, outreachStatus])
   @@index([poolStatus])
   @@index([screeningStatus])
 }
@@ -526,4 +488,40 @@ model AgentMemory {
   @@index([scope])
   @@index([key])
   @@index([ruleProfileId])
+}
+
+model AgentEvaluationCase {
+  id                    Int       @id @default(autoincrement())
+  caseKey               String    @unique
+  datasetVersion        String    @default("v1")
+  campaignTaskId        Int
+  creatorId             Int
+  evidenceSnapshot      Json
+  agentDecision         String
+  agentReason           String?   @db.Text
+  agentConfidence       Float?
+  agentModel            String?
+  aiCalls               Int       @default(0)
+  aiCostYuan            Float     @default(0)
+  outreachScript        String?   @db.Text
+  humanADecision        String?
+  humanAReason          String?   @db.Text
+  humanAConfidence      Int?
+  humanBDecision        String?
+  humanBReason          String?   @db.Text
+  humanBConfidence      Int?
+  adjudicatedDecision   String?
+  adjudicationReason    String?   @db.Text
+  outreachReview        String?
+  outreachReviewReason  String?   @db.Text
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  campaignTask CampaignTask @relation(fields: [campaignTaskId], references: [id], onDelete: Cascade)
+  creator      Creator      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignTaskId, creatorId, datasetVersion])
+  @@index([campaignTaskId, datasetVersion])
+  @@index([humanADecision])
+  @@index([adjudicatedDecision])
 }

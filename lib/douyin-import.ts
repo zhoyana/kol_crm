@@ -346,19 +346,6 @@ function normalizeFilterTerms(terms?: string[]): string[] {
   return Array.from(new Set((terms || []).map((term) => normalizeIntentText(term)).filter(Boolean)));
 }
 
-function candidateSearchText(candidate: DouyinDiscoveryCandidate): string {
-  return normalizeIntentText(
-    [
-      candidate.name,
-      candidate.category || "",
-      candidate.sampleTitle,
-      candidate.notes || "",
-      candidate.sourceKeywords.join(" "),
-      ...candidate.works.map((work) => `${work.title} ${work.sourceKeyword}`)
-    ].join(" ")
-  );
-}
-
 function candidateContentText(candidate: DouyinDiscoveryCandidate): string {
   return normalizeIntentText(
     [
@@ -1043,6 +1030,11 @@ async function getDouyinJsonlDir(): Promise<string> {
   return path.join(process.cwd(), "..", "MediaCrawler-main", "data", "douyin", "jsonl");
 }
 
+function getDouyinTaskJsonlDir(taskId: string): string {
+  const safeTaskId = String(taskId || "").replace(/[^a-zA-Z0-9_-]/g, "");
+  return path.join(process.cwd(), ".runtime", "mediacrawler-runs", safeTaskId, "douyin", "jsonl");
+}
+
 export async function findLatestDouyinResultFile(): Promise<string | null> {
   const jsonlDir = await getDouyinJsonlDir();
   try {
@@ -1096,11 +1088,12 @@ export async function searchDouyinResultFiles(keyword: string): Promise<{ candid
 }
 
 export async function searchDouyinResultFilesByTask(input: {
+  taskId?: string | null;
   keyword: string;
   startedAt?: string | null;
   activeKeywords?: string[];
 }): Promise<{ candidates: DouyinDiscoveryCandidate[]; sourceFiles: string[] }> {
-  const jsonlDir = await getDouyinJsonlDir();
+  const jsonlDir = input.taskId ? getDouyinTaskJsonlDir(input.taskId) : await getDouyinJsonlDir();
   const allowedKeywords = (input.activeKeywords?.length ? input.activeKeywords : [input.keyword])
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean);
@@ -1216,4 +1209,3 @@ export async function searchDouyinCandidatesFromWorkPool(keyword: string): Promi
     // prisma singleton — do not disconnect
   }
 }
-

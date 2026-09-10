@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importDouyinCandidates, type DouyinDiscoveryCandidate, type DouyinWork } from "@/lib/douyin-import";
 import { verifyDouyinHomepageCandidateFast, type HomepageReviewRules } from "@/lib/douyin-homepage";
+import { agentIdFromRequest } from "@/lib/central-agent-auth";
+import { withLocalAgentDevice } from "@/lib/local-agent-client";
 import { prisma } from "@/lib/prisma";
 
 function normalizeWorks(works: any[]): DouyinWork[] {
@@ -124,6 +126,10 @@ async function writeCampaignReviewResult(prisma: any, creatorId: number, campaig
 }
 
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  return withLocalAgentDevice(agentIdFromRequest(request), () => handlePost(request, context));
+}
+
+async function handlePost(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "还没有配置 DATABASE_URL，请先连接 MySQL。" }, { status: 400 });
   }
@@ -164,7 +170,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     }
 
     const result = await verifyDouyinHomepageCandidateFast(toReviewCandidate(creator), rules, {
-      workLimit: body?.workLimit || 6,
+      workLimit: body?.workLimit || 12,
       allowFullRetry: body?.allowFullRetry ?? true,
       skipObviousMismatch: body?.skipObviousMismatch ?? true
     });

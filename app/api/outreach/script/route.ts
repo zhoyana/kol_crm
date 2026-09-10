@@ -35,22 +35,6 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
-function gradeCreator(fans: number, stablePlay: number, currentCpm: number | null): Creator["grade"] {
-  const playFanRatio = fans > 0 ? stablePlay / fans : 0;
-  if (playFanRatio >= 3 && stablePlay >= 100000 && (!currentCpm || currentCpm <= 18)) return "S";
-  if (playFanRatio >= 2 && stablePlay >= 50000 && (!currentCpm || currentCpm <= 25)) return "A";
-  if (playFanRatio >= 1 && stablePlay >= 20000) return "B";
-  if (stablePlay >= 5000) return "C";
-  return "D";
-}
-
-function priorityFor(grade: Creator["grade"], outreachStatus: string): Creator["priority"] {
-  const pending = ["未", "待", "暂无"].some((keyword) => outreachStatus.includes(keyword));
-  if (pending && (grade === "S" || grade === "A")) return "high";
-  if (grade === "S" || grade === "A" || grade === "B") return "medium";
-  return "low";
-}
-
 function buildCampaignTask(row: any): OutreachCampaignTask | null {
   if (!row) return null;
   return {
@@ -74,8 +58,7 @@ function buildCreator(row: any, linkedTask?: any): Creator {
   const quote = row.quote ?? null;
   const currentCpm = quote && stablePlay ? Number(((quote / stablePlay) * 1000).toFixed(1)) : null;
   const suggestedPrice = Math.round((stablePlay / 1000) * 15);
-  const grade = gradeCreator(row.fans || 0, stablePlay, currentCpm);
-  const outreachStatus = row.outreachStatus || "未建联";
+  const outreachStatus = linkedTask?.outreachStatus || row.outreachStatus || "未建联";
 
   return {
     id: row.externalId || String(row.id),
@@ -98,9 +81,7 @@ function buildCreator(row: any, linkedTask?: any): Creator {
     avgPlay,
     stablePlay,
     currentCpm,
-    suggestedPrice,
-    grade,
-    priority: priorityFor(grade, outreachStatus)
+    suggestedPrice
   };
 }
 
@@ -162,13 +143,21 @@ export async function POST(request: NextRequest) {
         works: creatorRow.works || []
       });
 
+      if (result.source !== "ai") {
+        return NextResponse.json(
+          { error: `AI 个性化话术未生成：${result.error || result.reason}` },
+          { status: 502 }
+        );
+      }
+
       await prisma.outreachLog.create({
         data: {
           creatorId: creatorRow.id,
+          campaignTaskId,
           action: campaignTaskId ? "generate_campaign_ai_script" : "generate_ai_script",
           content: `复用画像：${result.portrait}\n\n生成建联话术：${result.script}`,
-          oldStatus: creatorRow.outreachStatus,
-          newStatus: creatorRow.outreachStatus
+          oldStatus: linkedTask?.outreachStatus || creatorRow.outreachStatus,
+          newStatus: linkedTask?.outreachStatus || creatorRow.outreachStatus
         }
       });
 

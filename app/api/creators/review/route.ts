@@ -52,20 +52,33 @@ export async function GET(request: NextRequest) {
           select: {
             id: true,
             externalId: true,
-            name: true
+            name: true,
+            platform: true,
+            profileUrl: true
           }
         }
       },
       orderBy: { updatedAt: "asc" },
       take: 600
     });
-    const creators = links.map((link: any) => ({
-      id: link.creator.id,
-      externalId: link.creator.externalId || String(link.creator.id),
-      name: link.creator.name,
-      poolStatus: link.poolStatus,
-      screeningStatus: link.screeningStatus
-    }));
+    const creators = links
+      .map((link: any) => ({
+        id: link.creator.id,
+        externalId: link.creator.externalId || String(link.creator.id),
+        name: link.creator.name,
+        platform: link.creator.platform,
+        profileUrl: link.creator.profileUrl,
+        poolStatus: link.poolStatus,
+        screeningStatus: link.screeningStatus
+      }))
+      // Early teaching-mode Douyin imports contain only an irreversible hash.
+      // They cannot be opened for homepage profiling, so excluding them here
+      // keeps the displayed queue count identical to the executable queue.
+      .filter((creator: any) =>
+        stage !== "profiling" ||
+        creator.platform !== "抖音" ||
+        String(creator.profileUrl || "").includes("douyin.com/user/")
+      );
 
     return NextResponse.json({
       ok: true,
@@ -75,6 +88,12 @@ export async function GET(request: NextRequest) {
       ids: creators.map((creator: any) => creator.externalId || `db:${creator.id}`),
       creators
     });
+  } catch (error) {
+    console.error("[review GET]", error);
+    return NextResponse.json(
+      { error: "Failed to load review list.", detail: String(error) },
+      { status: 500 }
+    );
   } finally {
     // prisma singleton — do not disconnect
   }

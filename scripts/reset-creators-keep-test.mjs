@@ -29,14 +29,7 @@ try {
       outreachLogs: true,
       aiEvaluations: true,
       feedbacks: true,
-      campaignTasks: true,
-      outreachConversation: {
-        include: {
-          messages: true,
-          aiSuggestions: { include: { feedbacks: true } },
-          feedbacks: true
-        }
-      }
+      campaignTasks: true
     }
   });
 

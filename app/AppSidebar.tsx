@@ -11,9 +11,8 @@ const navigation: NavGroup[] = [
     label: "达人工作流",
     items: [
       { href: "/discover", label: "达人发现" },
-      { href: "/review", label: "达人复筛" },
-      { href: "/creators", label: "达人库" },
-      { href: "/tasks", label: "建联任务" }
+      { href: "/review", label: "画像与复筛" },
+      { href: "/creators", label: "达人库与建联" }
     ]
   },
   {
@@ -23,7 +22,6 @@ const navigation: NavGroup[] = [
   {
     label: "数据",
     items: [
-      { href: "/import", label: "数据导入" },
       { href: "/revisits", label: "数据回访" }
     ]
   }

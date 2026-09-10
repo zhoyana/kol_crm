@@ -43,7 +43,6 @@ async function saveEvaluation(externalId: string, evaluation: Awaited<ReturnType
       data: {
         creatorId: creator.id,
         matchScore: evaluation.matchScore,
-        grade: evaluation.grade,
         recommendedAction: evaluation.recommendedAction,
         suggestedCooperation: evaluation.suggestedCooperation,
         riskTags: evaluation.riskTags,

@@ -8,7 +8,7 @@ type CreatorProfileEditorProps = {
   creator: Creator;
 };
 
-const outreachStatuses = ["未建联", "已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃"];
+const outreachStatuses = ["未建联", "已建联"];
 const cooperationStatuses = ["", "待确认", "确定合作", "报价过高", "已拒绝", "暂缓"];
 
 export function CreatorProfileEditor({ creator }: CreatorProfileEditorProps) {
@@ -18,7 +18,6 @@ export function CreatorProfileEditor({ creator }: CreatorProfileEditorProps) {
   const [form, setForm] = useState({
     profileUrl: creator.profileUrl,
     contact: creator.contact === "-" ? "" : creator.contact,
-    quote: creator.quote ? String(creator.quote) : "",
     outreachStatus: creator.outreachStatus,
     cooperationStatus: creator.cooperationStatus === "-" ? "" : creator.cooperationStatus,
     notes: creator.notes
@@ -37,8 +36,7 @@ export function CreatorProfileEditor({ creator }: CreatorProfileEditorProps) {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        ...form,
-        quote: form.quote ? Number(form.quote) : null
+        ...form
       })
     });
     const result = (await response.json().catch(() => ({}))) as { error?: string };
@@ -59,7 +57,7 @@ export function CreatorProfileEditor({ creator }: CreatorProfileEditorProps) {
       <div className="panel-header">
         <div>
           <h2>运营资料</h2>
-          <p>维护主页链接、联系方式、报价、状态和备注。</p>
+          <p>维护主页链接、联系方式、状态和备注。</p>
         </div>
         <button disabled={isPending} onClick={saveProfile} type="button">
           {isPending ? "保存中..." : "保存"}
@@ -74,10 +72,6 @@ export function CreatorProfileEditor({ creator }: CreatorProfileEditorProps) {
         <label>
           联系方式
           <input onChange={(event) => updateField("contact", event.target.value)} value={form.contact} />
-        </label>
-        <label>
-          当前报价
-          <input inputMode="numeric" onChange={(event) => updateField("quote", event.target.value)} value={form.quote} />
         </label>
         <label>
           建联状态

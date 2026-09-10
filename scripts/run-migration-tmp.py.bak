@@ -1,0 +1,128 @@
+"""Run 20260826_task_outreach_status.sql migration on production DB."""
+import pymysql
+import sys
+
+DB_CONFIG = {
+    "host": "120.55.180.104",
+    "port": 3306,
+    "database": "biz_cpyx_db",
+    "user": "svc_cp_ai",
+    "password": "cp123456!",
+    "charset": "utf8mb4",
+    "autocommit": True,
+}
+
+def check_column_exists(cursor, table, column):
+    cursor.execute(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (DB_CONFIG["database"], table, column),
+    )
+    return cursor.fetchone()[0] > 0
+
+def check_index_exists(cursor, table, index_name):
+    cursor.execute(
+        "SELECT COUNT(*) FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND INDEX_NAME = %s",
+        (DB_CONFIG["database"], table, index_name),
+    )
+    return cursor.fetchone()[0] > 0
+
+def check_fk_exists(cursor, constraint_name):
+    cursor.execute(
+        "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
+        "WHERE TABLE_SCHEMA = %s AND CONSTRAINT_NAME = %s AND CONSTRAINT_TYPE = 'FOREIGN KEY'",
+        (DB_CONFIG["database"], constraint_name),
+    )
+    return cursor.fetchone()[0] > 0
+
+def main():
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    steps = []
+
+    try:
+        # Step 1: CreatorCampaignTask.outreachStatus
+        if not check_column_exists(cursor, "CreatorCampaignTask", "outreachStatus"):
+            cursor.execute(
+                "ALTER TABLE `CreatorCampaignTask` "
+                "ADD COLUMN `outreachStatus` VARCHAR(191) NOT NULL DEFAULT '未建联'"
+            )
+            steps.append("1. ADD COLUMN CreatorCampaignTask.outreachStatus — DONE")
+        else:
+            steps.append("1. ADD COLUMN CreatorCampaignTask.outreachStatus — SKIPPED (already exists)")
+
+        # Step 2: Backfill from Creator.outreachStatus
+        cursor.execute(
+            "UPDATE `CreatorCampaignTask` AS link_row "
+            "JOIN `Creator` AS creator ON creator.`id` = link_row.`creatorId` "
+            "SET link_row.`outreachStatus` = CASE "
+            "  WHEN creator.`outreachStatus` = '已建联' THEN '已建联' "
+            "  ELSE '未建联' END"
+        )
+        affected = cursor.rowcount
+        steps.append(f"2. Backfill outreachStatus from Creator — {affected} rows updated")
+
+        # Step 3: Index on CreatorCampaignTask(campaignTaskId, outreachStatus)
+        idx_name = "CreatorCampaignTask_campaignTaskId_outreachStatus_idx"
+        if not check_index_exists(cursor, "CreatorCampaignTask", idx_name):
+            cursor.execute(
+                f"CREATE INDEX `{idx_name}` ON `CreatorCampaignTask` (`campaignTaskId`, `outreachStatus`)"
+            )
+            steps.append(f"3. CREATE INDEX {idx_name} — DONE")
+        else:
+            steps.append(f"3. CREATE INDEX {idx_name} — SKIPPED (already exists)")
+
+        # Step 4: OutreachLog.campaignTaskId
+        if not check_column_exists(cursor, "OutreachLog", "campaignTaskId"):
+            cursor.execute("ALTER TABLE `OutreachLog` ADD COLUMN `campaignTaskId` INTEGER NULL")
+            steps.append("4. ADD COLUMN OutreachLog.campaignTaskId — DONE")
+        else:
+            steps.append("4. ADD COLUMN OutreachLog.campaignTaskId — SKIPPED (already exists)")
+
+        # Step 5: Index on OutreachLog(campaignTaskId)
+        idx_name2 = "OutreachLog_campaignTaskId_idx"
+        if not check_index_exists(cursor, "OutreachLog", idx_name2):
+            cursor.execute(f"CREATE INDEX `{idx_name2}` ON `OutreachLog` (`campaignTaskId`)")
+            steps.append(f"5. CREATE INDEX {idx_name2} — DONE")
+        else:
+            steps.append(f"5. CREATE INDEX {idx_name2} — SKIPPED (already exists)")
+
+        # Step 6: Foreign key
+        fk_name = "OutreachLog_campaignTaskId_fkey"
+        if not check_fk_exists(cursor, fk_name):
+            cursor.execute(
+                f"ALTER TABLE `OutreachLog` ADD CONSTRAINT `{fk_name}` "
+                "FOREIGN KEY (`campaignTaskId`) REFERENCES `CampaignTask`(`id`) "
+                "ON DELETE SET NULL ON UPDATE CASCADE"
+            )
+            steps.append(f"6. ADD FK {fk_name} — DONE")
+        else:
+            steps.append(f"6. ADD FK {fk_name} — SKIPPED (already exists)")
+
+        print("=" * 60)
+        print("MIGRATION COMPLETE")
+        print("=" * 60)
+        for s in steps:
+            print(f"  {s}")
+
+        # Verify
+        cursor.execute(
+            "SELECT COUNT(*) FROM `CreatorCampaignTask` WHERE `outreachStatus` = '未建联'"
+        )
+        not_linked = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*) FROM `CreatorCampaignTask` WHERE `outreachStatus` = '已建联'"
+        )
+        linked = cursor.fetchone()[0]
+        print(f"\nVerification: 未建联={not_linked}, 已建联={linked}, total={not_linked + linked}")
+
+    except Exception as e:
+        print(f"MIGRATION ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        cursor.close()
+        conn.close()
+
+if __name__ == "__main__":
+    main()

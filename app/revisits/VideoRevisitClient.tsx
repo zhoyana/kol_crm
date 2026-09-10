@@ -1,81 +1,167 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type Task = { id: number; name: string; productName: string; category: string | null };
-type Visit = { id: number; likeCount: number; commentCount: number; revisitedAt: string };
-type Target = {
-  id: number; videoUrl: string; title: string | null; creatorName: string | null;
-  publishedAt: string | null; category: string | null; visits: Visit[];
+type OnlineAgent = { id: string; name: string; version: string; lastSeenAt: string };
+type BatchJob = {
+  id: string;
+  fileName: string;
+  outputName: string;
+  status: "running" | "completed" | "failed";
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  failureSamples: string[];
+  message: string;
+  error: string;
+  downloadable: boolean;
 };
 
-function fmtDate(value: string | null) {
-  return value ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "-";
-}
+const LAST_BATCH_JOB_KEY = "kol-crm:last-video-revisit-batch-job";
 
-function delta(current: number, previous?: number) {
-  if (previous === undefined) return "首次";
-  const value = current - previous;
-  return value > 0 ? `+${value.toLocaleString()}` : value.toLocaleString();
-}
-
-export function VideoRevisitClient({ tasks }: { tasks: Task[] }) {
-  const [targets, setTargets] = useState<Target[]>([]);
-  const [videoUrl, setVideoUrl] = useState("");
-  const [taskId, setTaskId] = useState(tasks[0]?.id ? String(tasks[0].id) : "");
-  const [category, setCategory] = useState("");
-  const [loading, setLoading] = useState(false);
+export function VideoRevisitClient() {
+  const [file, setFile] = useState<File | null>(null);
+  const [agentMode, setAgentMode] = useState<"direct" | "queue">("direct");
+  const [agents, setAgents] = useState<OnlineAgent[]>([]);
+  const [agentDeviceId, setAgentDeviceId] = useState("");
+  const [job, setJob] = useState<BatchJob | null>(null);
   const [message, setMessage] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const load = useCallback(async () => {
-    const response = await fetch("/api/video-revisits", { cache: "no-store" });
-    const data = await response.json();
-    if (response.ok) setTargets(data.targets || []);
+  useEffect(() => {
+    const jobId = window.localStorage.getItem(LAST_BATCH_JOB_KEY);
+    if (!jobId) return;
+    let cancelled = false;
+    void fetch(`/api/video-revisits/batch?id=${encodeURIComponent(jobId)}`, { cache: "no-store" })
+      .then(async (response) => {
+        const data = await response.json() as { job?: BatchJob };
+        if (!cancelled && response.ok && data.job) setJob(data.job);
+        else if (!cancelled) window.localStorage.removeItem(LAST_BATCH_JOB_KEY);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
   }, []);
-  useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshAgents() {
+      try {
+        const response = await fetch("/api/local-agents", { cache: "no-store" });
+        const data = await response.json() as { mode?: "direct" | "queue"; agents?: OnlineAgent[] };
+        if (cancelled) return;
+        const online = data.agents || [];
+        setAgentMode(data.mode === "queue" ? "queue" : "direct");
+        setAgents(online);
+        setAgentDeviceId((current) => online.some((agent) => agent.id === current) ? current : (online[0]?.id || ""));
+      } catch { /* upload will show the actionable error */ }
+    }
+    void refreshAgents();
+    const timer = window.setInterval(refreshAgents, 10_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    if (!job || job.status !== "running") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch(`/api/video-revisits/batch?id=${encodeURIComponent(job.id)}`, { cache: "no-store" });
+        const data = await response.json() as { job?: BatchJob; error?: string };
+        if (!response.ok || !data.job) throw new Error(data.error || "无法读取处理进度");
+        setJob(data.job);
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "无法读取处理进度");
+      }
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.status]);
+
+  const progress = useMemo(() => job?.total ? Math.min(100, Math.round(job.completed / job.total * 100)) : 0, [job]);
+  const running = job?.status === "running";
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    setLoading(true);
-    setMessage("正在排队并抓取视频数据，请保持专用 Chrome 开启…");
+    if (!file) return setMessage("请选择业务提供的 .xlsx 文件。");
+    if (agentMode === "queue" && !agentDeviceId) return setMessage("没有在线的达人采集助手，请先在本机启动 EXE。");
+    setMessage("");
+    const form = new FormData();
+    form.set("file", file);
+    if (agentDeviceId) form.set("agentDeviceId", agentDeviceId);
     try {
-      const response = await fetch("/api/video-revisits", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoUrl, campaignTaskId: taskId || null, category })
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "数据回访失败");
-      setVideoUrl("");
-      setMessage("抓取完成，已保存到库表。再次提交同一链接会新增一条回访记录。");
-      await load();
+      const response = await fetch("/api/video-revisits/batch", { method: "POST", body: form });
+      const data = await response.json() as { job?: BatchJob; error?: string };
+      if (!response.ok || !data.job) throw new Error(data.error || "Excel 批量回访启动失败");
+      setJob(data.job);
+      window.localStorage.setItem(LAST_BATCH_JOB_KEY, data.job.id);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "数据回访失败");
-    } finally { setLoading(false); }
+      setMessage(error instanceof Error ? error.message : "Excel 批量回访启动失败");
+    }
+  }
+
+  function reset() {
+    setFile(null);
+    setJob(null);
+    window.localStorage.removeItem(LAST_BATCH_JOB_KEY);
+    setMessage("");
+    if (inputRef.current) inputRef.current.value = "";
   }
 
   return (
-    <section className="content revisit-page">
-      <header className="topbar"><div><h1>视频数据回访</h1><p>粘贴抖音视频链接，抓取点赞、评论和发布时间，并按品类保存每次回访记录。</p></div></header>
-      <form className="panel revisit-form" onSubmit={submit}>
-        <div className="section-kicker">01 · 新建回访</div><h2>抓取一条视频</h2>
-        <div className="revisit-fields">
-          <label className="revisit-url"><span>抖音视频链接</span><input required value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} placeholder="https://www.douyin.com/video/... 或 v.douyin.com 短链接" /></label>
-          <label><span>所属任务 / 品类</span><select value={taskId} onChange={(e) => setTaskId(e.target.value)}><option value="">不关联任务</option>{tasks.map((task) => <option key={task.id} value={task.id}>{task.name}（{task.category || task.productName}）</option>)}</select></label>
-          <label><span>品类覆盖（可选）</span><input value={category} onChange={(e) => setCategory(e.target.value)} placeholder="默认使用所选任务品类" /></label>
-          <button className="primary-button" disabled={loading}>{loading ? "抓取中…" : "抓取并保存"}</button>
+    <section className="content revisit-page batch-revisit-page">
+      <header className="topbar">
+        <div>
+          <h1>视频数据批量回访</h1>
+          <p>上传业务提供的 Excel，系统抓取抖音和小红书作品的发布时间、回访时间、点赞、评论、转发和收藏，再将结果追加到原文件右侧供下载。</p>
         </div>
-        {message && <p className={message.includes("完成") ? "form-message success" : "form-message"}>{message}</p>}
+      </header>
+
+      <form className="panel batch-revisit-upload" onSubmit={submit}>
+        <div className="section-kicker">01 · 上传文件</div>
+        <div className="batch-revisit-heading">
+          <div><h2>导入业务 Excel</h2><p>自动识别“发布链接”列；“博主账号名称”等原有列、行顺序和内容保持不变。</p></div>
+          <span className="batch-file-rule">支持 .xlsx · 最大 20MB</span>
+        </div>
+        <label className="batch-file-picker">
+          <input ref={inputRef} accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={running} onChange={(event) => setFile(event.target.files?.[0] || null)} type="file" />
+          <strong>{file?.name || "选择 Excel 文件"}</strong>
+          <span>{file ? `${(file.size / 1024).toFixed(1)} KB` : "表头需包含：发布链接"}</span>
+        </label>
+        {agentMode === "queue" ? (
+          <label className="batch-agent-select">
+            <span>使用这台电脑采集</span>
+            <select disabled={running} onChange={(event) => setAgentDeviceId(event.target.value)} value={agentDeviceId}>
+              {agents.length ? agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}（在线）</option>) : <option value="">未检测到采集助手</option>}
+            </select>
+          </label>
+        ) : null}
+        <div className="batch-revisit-actions">
+          <button disabled={running || !file || (agentMode === "queue" && !agentDeviceId)} type="submit">{running ? "正在批量回访…" : "开始批量抓取"}</button>
+          {job && !running ? <button className="secondary-button" onClick={reset} type="button">处理另一份文件</button> : null}
+        </div>
+        {message ? <p className="form-error">{message}</p> : null}
       </form>
-      <div className="panel revisit-list">
-        <div className="section-kicker">02 · 库表</div><h2>回访记录</h2>
-        {!targets.length ? <div className="empty-state">还没有回访记录。粘贴第一条视频链接开始测试。</div> : <div className="table-wrap"><table><thead><tr><th>视频</th><th>品类</th><th>发布时间</th><th>回访时间</th><th>点赞</th><th>评论</th><th>变化</th></tr></thead><tbody>
-          {targets.flatMap((target) => target.visits.map((visit, index) => { const previous = target.visits[index + 1]; return <tr key={visit.id}>
-            <td><a href={target.videoUrl} target="_blank" rel="noreferrer">{target.title || "查看视频"}</a><small>{target.creatorName || "未知作者"}</small></td>
-            <td>{target.category || "未分类"}</td><td>{fmtDate(target.publishedAt)}</td><td>{fmtDate(visit.revisitedAt)}</td>
-            <td>{visit.likeCount.toLocaleString()}</td><td>{visit.commentCount.toLocaleString()}</td><td><small>赞 {delta(visit.likeCount, previous?.likeCount)} · 评 {delta(visit.commentCount, previous?.commentCount)}</small></td>
-          </tr>; }))}
-        </tbody></table></div>}
-      </div>
+
+      {job ? (
+        <section className={`panel batch-revisit-progress ${job.status}`}>
+          <div className="section-kicker">02 · 本次处理</div>
+          <div className="batch-progress-title"><div><h2>{job.fileName}</h2><p>{job.error || job.message}</p></div><strong>{progress}%</strong></div>
+          <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
+          <div className="batch-progress-stats">
+            <div><span>总数</span><strong>{job.total}</strong></div>
+            <div><span>已处理</span><strong>{job.completed}</strong></div>
+            <div className="success"><span>成功</span><strong>{job.succeeded}</strong></div>
+            <div className="failed"><span>失败</span><strong>{job.failed}</strong></div>
+          </div>
+          {job.failureSamples?.length ? (
+            <div className="batch-failure-samples">
+              <strong>失败原因（前 {job.failureSamples.length} 条）</strong>
+              <ul>{job.failureSamples.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+            </div>
+          ) : null}
+          {job.downloadable ? <a className="button-link batch-download" href={`/api/video-revisits/batch?id=${encodeURIComponent(job.id)}&download=1`}>下载 {job.outputName}</a> : null}
+          <small className="batch-expiry-note">结果仅用于本次下载，不进入网页回访库；生成后请在两小时内下载。</small>
+        </section>
+      ) : null}
     </section>
   );
 }

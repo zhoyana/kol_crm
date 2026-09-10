@@ -632,7 +632,7 @@ export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: 
       const data = await parseResponse(response);
 
       if (!response.ok) {
-        setError(data.error || "加入主页样本与画像队列失败。");
+        setError(data.error || "加入待画像失败。");
         return;
       }
 
@@ -706,20 +706,31 @@ export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: 
           <p>先用关键词和话题采集作品，再筛出近6个月点赞500+作品对应的作者。</p>
         </div>
         <div className="discover-search">
-          <textarea onChange={(event) => setKeyword(event.target.value)} placeholder={"例如：警校生\n警校生日常\n藏蓝青春"} rows={2} value={keyword} />
-          <input min={10} max={300} onChange={(event) => setMaxNotes(Number(event.target.value))} title="每个关键词采集数量" type="number" value={maxNotes} />
-          <select disabled value={discoveryMode}>
-            <option value="single">关键词作品采集 + 聚合</option>
-          </select>
-          <button disabled={loading !== "" || isTaskActive} onClick={startCrawler} type="button">
-            {loading === "crawl" || task?.status === "running" ? "采集中..." : "启动采集"}
-          </button>
-          <button className="secondary-button" disabled={loading !== ""} onClick={searchCandidates} type="button">
-            {loading === "search" ? "查询中..." : "查询待选候选"}
-          </button>
-          <button className="secondary-button" disabled={loading !== "" || isTaskActive} onClick={clearWorkPool} type="button">
-            {loading === "clear" ? "清空中..." : "清空作品池"}
-          </button>
+          <label className="discover-field discover-keyword-field">
+            <span>采集关键词</span>
+            <textarea onChange={(event) => setKeyword(event.target.value)} placeholder={"多个关键词请用逗号分隔，例如：警校生、警校生日常、藏蓝青春"} rows={2} value={keyword} />
+          </label>
+          <label className="discover-field discover-count-field">
+            <span>每词作品数</span>
+            <input min={10} max={300} onChange={(event) => setMaxNotes(Number(event.target.value))} type="number" value={maxNotes} />
+          </label>
+          <label className="discover-field discover-mode-field">
+            <span>采集方式</span>
+            <select disabled value={discoveryMode}>
+              <option value="single">关键词作品采集 + 聚合</option>
+            </select>
+          </label>
+          <div className="discover-search-actions">
+            <button className="discover-primary-action" disabled={loading !== "" || isTaskActive} onClick={startCrawler} type="button">
+              {loading === "crawl" || task?.status === "running" ? "采集中..." : "启动采集"}
+            </button>
+            <button className="secondary-button" disabled={loading !== ""} onClick={searchCandidates} type="button">
+              {loading === "search" ? "查询中..." : "查询待选候选"}
+            </button>
+            <button className="secondary-button discover-clear-action" disabled={loading !== "" || isTaskActive} onClick={clearWorkPool} type="button">
+              {loading === "clear" ? "清空中..." : "清空作品池"}
+            </button>
+          </div>
         </div>
       </section>
 
@@ -837,7 +848,7 @@ export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: 
               <span className="workflow-kicker">04 · 候选结果</span>
               <h2>达人待选候选</h2>
               <p>
-                找到 {result.total} 个新候选，已选择 {selectedIds.length} 个。当前会自动隐藏已经进入样本/画像队列、待选、精选、跳过和已排除的达人。
+                找到 {result.total} 个新候选，已选择 {selectedIds.length} 个。当前会自动隐藏已经进入待画像、待选、精选、跳过和已排除的达人。
               </p>
               {result.stats ? (
                 <p>
@@ -853,7 +864,7 @@ export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: 
                 全选
               </button>
               <button disabled={!selectedCandidates.length || loading !== ""} onClick={importSelected} type="button">
-                {loading === "import" ? "加入中..." : "加入主页样本与画像队列"}
+                {loading === "import" ? "加入中..." : "加入待画像"}
               </button>
             </div>
           </div>
@@ -872,7 +883,7 @@ export function DiscoverClient({ initialBrandLibraries, initialCampaignTasks }: 
 
           {importResult ? (
             <div className="result-box discover-result">
-              <strong>已加入主页样本与画像队列</strong>
+              <strong>已加入待画像</strong>
               <p>
                 新增 {importResult.imported} 条，更新 {importResult.updated} 条，跳过 {importResult.skipped} 条。
               </p>

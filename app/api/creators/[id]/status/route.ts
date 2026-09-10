@@ -7,8 +7,7 @@ type RouteContext = {
   }>;
 };
 
-const allowedStatuses = new Set(["未建联", "待发送确认", "发送中", "已建联", "需跟进", "已回复", "报价中", "确定合作", "已拒绝", "已放弃"]);
-const contactedStatuses = new Set(["发送中", "已建联", "需跟进", "已回复", "报价中", "确定合作"]);
+const allowedStatuses = new Set(["未建联", "已建联"]);
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   if (!process.env.DATABASE_URL) {
@@ -22,12 +21,15 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
         cooperationStatus?: string;
         action?: string;
         content?: string;
+        campaignTaskId?: number | string | null;
       }
     | null;
 
   if (!body?.outreachStatus || !allowedStatuses.has(body.outreachStatus)) {
     return NextResponse.json({ error: "无效的建联状态。" }, { status: 400 });
   }
+
+  const campaignTaskId = Number(body.campaignTaskId || 0) || null;
 
   try {
     // prisma singleton from import
@@ -44,38 +46,57 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
         return NextResponse.json({ error: "没有找到达人。" }, { status: 404 });
       }
 
-      if (body.action === "open_contact" && contactedStatuses.has(creator.outreachStatus)) {
-        return NextResponse.json(
-          { error: `该达人当前状态为“${creator.outreachStatus}”，已阻止重复打开初次建联流程。` },
-          { status: 409 }
-        );
+
+      const taskLink = campaignTaskId
+        ? await prisma.creatorCampaignTask.findUnique({
+            where: { creatorId_campaignTaskId: { creatorId: creator.id, campaignTaskId } }
+          })
+        : null;
+
+      if (campaignTaskId && !taskLink) {
+        return NextResponse.json({ error: "这个达人不在所选品类任务中。" }, { status: 404 });
       }
-      if (body.outreachStatus === creator.outreachStatus) {
+
+      const currentStatus = taskLink?.outreachStatus || creator.outreachStatus;
+
+      if (body.outreachStatus === currentStatus) {
         return NextResponse.json({
           creator: {
             id: creator.externalId || String(creator.id),
             name: creator.name,
-            outreachStatus: creator.outreachStatus,
+            outreachStatus: currentStatus,
             cooperationStatus: creator.cooperationStatus
           },
           unchanged: true
         });
       }
 
-      const updated = await prisma.creator.update({
-        where: { id: creator.id },
-        data: {
-          outreachStatus: body.outreachStatus,
-          cooperationStatus: body.cooperationStatus ?? creator.cooperationStatus
-        }
-      });
+      if (taskLink) {
+        await prisma.creatorCampaignTask.update({
+          where: { id: taskLink.id },
+          data: { outreachStatus: body.outreachStatus }
+        });
+      } else {
+        await prisma.creator.update({
+          where: { id: creator.id },
+          data: { outreachStatus: body.outreachStatus }
+        });
+      }
+
+      const updated = body.cooperationStatus === undefined
+        ? creator
+        : await prisma.creator.update({
+            where: { id: creator.id },
+            data: { cooperationStatus: body.cooperationStatus }
+          });
 
       await prisma.outreachLog.create({
         data: {
           creatorId: creator.id,
+          campaignTaskId,
           action: body.action || "update_status",
           content: body.content || null,
-          oldStatus: creator.outreachStatus,
+          oldStatus: currentStatus,
           newStatus: body.outreachStatus
         }
       });
@@ -84,7 +105,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
         creator: {
           id: updated.externalId || String(updated.id),
           name: updated.name,
-          outreachStatus: updated.outreachStatus,
+          outreachStatus: body.outreachStatus,
           cooperationStatus: updated.cooperationStatus
         }
       });

@@ -74,20 +74,6 @@ function includesAny(text: string, terms: string[]): boolean {
   return terms.some((term) => text.includes(normalizeText(term)));
 }
 
-function taskText(task: CampaignTask | null): string {
-  if (!task) return "";
-  return [
-    task.name,
-    task.productName,
-    task.category || "",
-    task.targetAudience,
-    task.targetDescription,
-    ...(task.seedKeywords || []),
-    ...(task.excludeKeywords || []),
-    ...(task.productSellingPoints || [])
-  ].join(" ");
-}
-
 function compactCandidate(candidate: DouyinDiscoveryCandidate) {
   return {
     id: candidate.externalId,
@@ -164,11 +150,15 @@ function localHardDecision(candidate: DouyinDiscoveryCandidate, template: Discov
     return { id: candidate.externalId, decision: "drop", reason: `明显属于其他垂类，未发现${template.name}目标身份或场景` };
   }
 
-  if (!candidate.works.some((work) => work.likeCount > template.candidateScreen.minSampleLikes)) {
+  const isXhs = candidate.platform === "小红书" || String(candidate.externalId || "").startsWith("xhs-");
+  // 小红书互动量级低于抖音，按平台放宽点赞门槛（抖音保持模板阈值）。
+  // 初筛只负责排除明显死号/搬运号，身份精判交给画像阶段 AI——门槛过低会误杀真实素人。
+  const minSampleLikes = isXhs ? Math.min(template.candidateScreen.minSampleLikes, 30) : template.candidateScreen.minSampleLikes;
+  if (!candidate.works.some((work) => work.likeCount > minSampleLikes)) {
     return {
       id: candidate.externalId,
       decision: "drop",
-      reason: `当前样本没有点赞超过${template.candidateScreen.minSampleLikes}的作品`
+      reason: `当前样本没有点赞超过${minSampleLikes}的作品`
     };
   }
   return null;
@@ -248,7 +238,7 @@ async function requestBatch(
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as CandidateScreenRequest | null;
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY;
   if (!apiKey) return NextResponse.json({ error: "还没有配置 OPENAI_API_KEY。" }, { status: 400 });
 
   const keyword = body?.keyword?.trim() || "";
@@ -265,8 +255,8 @@ export async function POST(request: NextRequest) {
       .filter((item): item is CandidateDecision => Boolean(item));
     const locallyHandled = new Set(localDecisions.map((item) => item.id));
     const modelCandidates = candidates.filter((candidate) => !locallyHandled.has(candidate.externalId));
-    const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const baseUrl = (process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1").replace(/\/$/, "");
+    const model = process.env.OPENAI_MODEL || process.env.DEEPSEEK_MODEL || "deepseek-chat";
     const batches: DouyinDiscoveryCandidate[][] = [];
     for (let index = 0; index < modelCandidates.length; index += 30) {
       batches.push(modelCandidates.slice(index, index + 30));

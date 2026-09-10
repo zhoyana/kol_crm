@@ -35,6 +35,7 @@ export type OutreachScriptResult = {
   portrait: string;
   source: "ai" | "fallback";
   provider: AiProvider;
+  error?: string;
 };
 
 type ApiConfig = {
@@ -55,13 +56,14 @@ function getApiConfig(provider: AiProvider): ApiConfig | null {
     };
   }
 
-  const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || "";
+  const apiKey = process.env.DEEPSEEK_API_KEY || "";
   if (!apiKey) return null;
 
+  const configuredBaseUrl = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1").replace(/\/$/, "");
   return {
     apiKey,
-    baseUrl: (process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1").replace(/\/$/, ""),
-    model: process.env.OPENAI_MODEL || process.env.DEEPSEEK_MODEL || "deepseek-chat"
+    baseUrl: /\/v1$/i.test(configuredBaseUrl) ? configuredBaseUrl : `${configuredBaseUrl}/v1`,
+    model: process.env.DEEPSEEK_MODEL || "deepseek-chat"
   };
 }
 
@@ -69,6 +71,14 @@ function cleanText(value: unknown): string {
   return String(value || "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function cleanScriptPlaceholders(value: unknown): string {
+  return cleanText(value)
+    .replace(/[【\[]\s*(?:产品名|具体产品|产品名称)\s*[】\]]/gi, "产品")
+    .replace(/(?:具体)?产品名/g, "产品")
+    .replace(/我们有个产品产品/g, "我们有个产品")
+    .replace(/有一款产品产品/g, "有一款产品");
 }
 
 function formatNumber(value: number): string {
@@ -153,7 +163,7 @@ function inferPersonalAnchors(input: OutreachScriptInput): string[] {
 function buildTaskContext(task?: OutreachCampaignTask | null) {
   return {
     name: task?.name || "未选择品类任务",
-    productName: task?.productName || "【产品名】",
+    productName: cleanText(task?.productName) || "产品",
     category: task?.category || "",
     targetAudience: task?.targetAudience || "",
     targetDescription: task?.targetDescription || "",
@@ -171,7 +181,7 @@ function buildCreatorPortrait(input: OutreachScriptInput): string {
 
   return [
     `账号：${creator.name}，${creator.category || "未分类"}，${poolStatusText(creator.poolStatus)}`,
-    `数据：粉丝 ${formatNumber(creator.fans)}，稳定播放 ${formatNumber(creator.stablePlay)}，建议报价 ¥${formatNumber(creator.suggestedPrice)}，评级 ${creator.grade}`,
+    `数据：粉丝 ${formatNumber(creator.fans)}，稳定播放 ${formatNumber(creator.stablePlay)}，建议报价 ¥${formatNumber(creator.suggestedPrice)}`,
     summaryLines.length ? `复筛画像：${summaryLines.join("；")}` : "",
     creator.notes ? `备注：${cleanText(creator.notes)}` : "",
     works.length ? `参考作品：${works.map((work, index) => `${index + 1}. ${work.title}（点赞 ${formatNumber(work.likeCount)}）`).join("；")}` : "",
@@ -181,20 +191,21 @@ function buildCreatorPortrait(input: OutreachScriptInput): string {
     .join("\n");
 }
 
-function fallbackOutreachScript(input: OutreachScriptInput): OutreachScriptResult {
+function fallbackOutreachScript(input: OutreachScriptInput, error?: string): OutreachScriptResult {
   return {
-    script: generateOutreachScript(input.creator),
+    script: cleanScriptPlaceholders(generateOutreachScript(input.creator)),
     angle: "本地兜底话术",
     reason: "未配置 AI 或 AI 返回失败，使用本地兜底话术。",
     portrait: buildCreatorPortrait(input),
     source: "fallback",
-    provider: input.provider || "default"
+    provider: input.provider || "default",
+    error
   };
 }
 
 function normalizeResult(value: Record<string, unknown>, input: OutreachScriptInput): OutreachScriptResult {
   const fallback = fallbackOutreachScript(input);
-  const script = cleanText(value.script);
+  const script = cleanScriptPlaceholders(value.script);
   if (!script) return fallback;
 
   return {
@@ -231,53 +242,58 @@ export async function generateAiOutreachScript(input: OutreachScriptInput): Prom
   };
 
   try {
-    const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    const requestBody = {
+      model: config.model,
+      temperature: 0.85,
+      messages: [
+        {
+          role: "system",
+          content: "你是蜀黍家的达人商务，擅长写自然、短、像真实私信的达人建联话术。必须只输出可解析 JSON，不要 Markdown。字段包括 script, angle, reason, portrait。生成时必须遵守以下绝对禁止项：禁止出现微信、QQ、手机号、电话、二维码、邮箱、链接、加好友、滴滴我、联系我、私我等任何外部联系方式；禁止出现合作、推广、广告、商务、品牌方求合作、CPS、分佣、佣金、报价、价格、费用等商业敏感词；不要涉及报价、价格、佣金、费用、结算方式等商业细节。"
+        },
+        {
+          role: "user",
+          content: [
+            "请为下面这个达人生成一条个性化建联私信。",
+            "硬性要求：",
+            "1. script 控制在 45-110 字，短、自然、像抖音/小红书/微信私信。",
+            "2. 必须结合 personalAnchors 或 recentWorks 里的 1 个具体点轻轻带一下，不要写成群发模板。",
+            "3. 必须沿用蜀黍家的基础话术风格：宝子、小宝、活动、产品、感兴趣、方便聊聊，但不要照抄示例。",
+              "4. productName 有明确名称时使用该名称；如果值只是“产品”或没有明确名称，只写“我们有个产品想邀请你体验”，严禁输出【产品名】、[产品名]等占位符。不要自己乱编品类。",
+            "5. 如果任务里有 outreachTone，必须遵守它。",
+            "6. 不要写：不是广告、共创优质内容、非常契合、期待您的回复、内容数据还不错。",
+            "7. 不确定达人身份时，不要断言身份，改成“刷到你分享过相关内容”。",
+            "8. 结尾用轻问句，比如：有兴趣了解一下嘛、方便聊聊吗、宝看有兴趣一起参与吗。",
+            "9. 绝对禁止出现任何外部联系方式：微信、QQ、手机号、电话、二维码、邮箱、链接、加好友、滴滴我、联系我、私我等。",
+            "10. 绝对禁止出现商业敏感词：合作、推广、广告、商务、品牌方求合作、CPS、分佣、佣金、报价、价格、费用等。",
+            "11. 不要涉及报价、价格、佣金、费用、结算方式等商业细节。",
+            "12. 每日生成话术前，从示例列表中按日期循环选择 1 个主要切入角度（如按星期 1-7 循环），再在该角度基础上做个性化变体，避免连续两天使用同一套切入。",
+            `输入数据：${JSON.stringify(payload, null, 2)}`
+          ].join("\n")
+        }
+      ]
+    };
+    const sendRequest = (useJsonMode: boolean) => fetch(`${config.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: config.model,
-        temperature: 0.85,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: "你是蜀黍家的达人商务，擅长写自然、短、像真实私信的达人建联话术。必须只输出可解析 JSON，不要 Markdown。字段包括 script, angle, reason, portrait。生成时必须遵守以下绝对禁止项：禁止出现微信、QQ、手机号、电话、二维码、邮箱、链接、加好友、滴滴我、联系我、私我等任何外部联系方式；禁止出现合作、推广、广告、商务、品牌方求合作、CPS、分佣、佣金、报价、价格、费用等商业敏感词；不要涉及报价、价格、佣金、费用、结算方式等商业细节。"
-          },
-          {
-            role: "user",
-            content: [
-              "请为下面这个达人生成一条个性化建联私信。",
-              "硬性要求：",
-              "1. script 控制在 45-110 字，短、自然、像抖音/小红书/微信私信。",
-              "2. 必须结合 personalAnchors 或 recentWorks 里的 1 个具体点轻轻带一下，不要写成群发模板。",
-              "3. 必须沿用蜀黍家的基础话术风格：宝子、小宝、活动、产品、感兴趣、方便聊聊，但不要照抄示例。",
-              "4. 产品名优先使用当前品类任务里的 productName，不要自己乱编品类。",
-              "5. 如果任务里有 outreachTone，必须遵守它。",
-              "6. 不要写：不是广告、共创优质内容、非常契合、期待您的回复、内容数据还不错。",
-              "7. 不确定达人身份时，不要断言身份，改成“刷到你分享过相关内容”。",
-              "8. 结尾用轻问句，比如：有兴趣了解一下嘛、方便聊聊吗、宝看有兴趣一起参与吗。",
-              "9. 绝对禁止出现任何外部联系方式：微信、QQ、手机号、电话、二维码、邮箱、链接、加好友、滴滴我、联系我、私我等。",
-              "10. 绝对禁止出现商业敏感词：合作、推广、广告、商务、品牌方求合作、CPS、分佣、佣金、报价、价格、费用等。",
-              "11. 不要涉及报价、价格、佣金、费用、结算方式等商业细节。",
-              "12. 每日生成话术前，从示例列表中按日期循环选择 1 个主要切入角度（如按星期 1-7 循环），再在该角度基础上做个性化变体，避免连续两天使用同一套切入。",
-              `输入数据：${JSON.stringify(payload, null, 2)}`
-            ].join("\n")
-          }
-        ]
-      })
+      body: JSON.stringify({ ...requestBody, ...(useJsonMode ? { response_format: { type: "json_object" } } : {}) })
     });
+    let response = await sendRequest(true);
+    if (!response.ok && [400, 404, 422].includes(response.status)) response = await sendRequest(false);
 
-    if (!response.ok) return fallbackOutreachScript(input);
+    if (!response.ok) {
+      const detail = cleanText(await response.text().catch(() => "")).slice(0, 240);
+      return fallbackOutreachScript(input, `AI 接口返回 ${response.status}${detail ? `：${detail}` : ""}`);
+    }
 
     const data = await response.json().catch(() => null);
     const parsed = safeJsonObject(String(data?.choices?.[0]?.message?.content || ""));
-    if (!parsed) return fallbackOutreachScript(input);
+    if (!parsed) return fallbackOutreachScript(input, "AI 返回内容无法解析为个性化话术。");
 
     return normalizeResult(parsed, input);
-  } catch {
-    return fallbackOutreachScript(input);
+  } catch (error) {
+    return fallbackOutreachScript(input, error instanceof Error ? error.message : "AI 接口请求失败。");
   }
 }

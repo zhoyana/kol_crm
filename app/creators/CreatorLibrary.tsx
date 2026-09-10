@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import type { BrandLibraryItem, CampaignTaskItem } from "@/lib/campaign-tasks";
 import { BrandTaskPicker } from "@/app/components/BrandTaskPicker";
 import type { Creator } from "@/lib/creators";
@@ -11,26 +11,12 @@ type CreatorLibraryProps = {
   initialBrandLibraries: BrandLibraryItem[];
   initialCampaignTasks: CampaignTaskItem[];
   initialCampaignTaskId: number | null;
+  initialPlatform: "全部" | "抖音" | "小红书";
 };
 
 const ALL = "全部";
 
-const gradeLabel: Record<string, string> = {
-  S: "S级",
-  A: "A级",
-  B: "B级",
-  C: "C级",
-  D: "D级"
-};
-
-const priorityLabel: Record<string, string> = {
-  high: "优先",
-  medium: "观察",
-  low: "暂缓"
-};
-
 const poolLabel: Record<string, string> = {
-  pending_review: "样本/画像队列",
   candidate: "达人待选库",
   featured: "达人精选库",
   skipped: "已跳过"
@@ -39,61 +25,55 @@ const poolLabel: Record<string, string> = {
 const poolTabs = [
   { value: ALL, label: "全部" },
   { value: "candidate", label: "达人待选库" },
-  { value: "featured", label: "达人精选库" },
-  { value: "pending_review", label: "样本/画像队列" },
-  { value: "skipped", label: "已跳过" }
+  { value: "featured", label: "达人精选库" }
 ];
 
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat("zh-CN").format(value || 0);
-}
+const businessPoolStatuses = new Set(["candidate", "featured"]);
 
 function getPoolLabel(status: string): string {
   return poolLabel[status] || status || "未分库";
 }
 
-function getGradeLabel(grade: string): string {
-  return gradeLabel[grade] || grade || "-";
+function localDateText(daysAgo = 0): string {
+  const date = new Date();
+  date.setDate(date.getDate() - daysAgo);
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 10);
 }
 
-function getPriorityLabel(priority: string): string {
-  return priorityLabel[priority] || priority || "-";
-}
-
-function csvCell(value: string | number | null | undefined): string {
-  const text = String(value ?? "");
-  return `"${text.replace(/"/g, '""')}"`;
-}
-
-function todayText(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId }: CreatorLibraryProps) {
+export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaignTasks, initialCampaignTaskId, initialPlatform }: CreatorLibraryProps) {
   const [items, setItems] = useState(creators);
   const [campaignTasks] = useState(initialCampaignTasks);
   const [selectedCampaignTaskId, setSelectedCampaignTaskId] = useState(initialCampaignTaskId ? String(initialCampaignTaskId) : "");
   const [keyword, setKeyword] = useState("");
-  const [platform, setPlatform] = useState(ALL);
+  const [platform] = useState(initialPlatform);
   const [status, setStatus] = useState(ALL);
-  const [grade, setGrade] = useState(ALL);
-  const [priority, setPriority] = useState(ALL);
   const [poolStatus, setPoolStatus] = useState(ALL);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [reviewingId, setReviewingId] = useState<string | null>(null);
   const [movingId, setMovingId] = useState<string | null>(null);
-  const [isBatchReviewing, setIsBatchReviewing] = useState(false);
   const [error, setError] = useState("");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [scripts, setScripts] = useState<Record<string, string>>({});
+  const [scriptStatus, setScriptStatus] = useState<Record<string, string>>({});
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [outreachSummary, setOutreachSummary] = useState("");
+  const [exportFrom, setExportFrom] = useState(() => localDateText(30));
+  const [exportTo, setExportTo] = useState(() => localDateText());
+  const [isExporting, setIsExporting] = useState(false);
 
-  const platforms = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.platform).filter(Boolean)))], [items]);
-  const statuses = useMemo(() => [ALL, ...Array.from(new Set(items.map((creator) => creator.outreachStatus).filter(Boolean)))], [items]);
+  const statuses = [ALL, "已建联", "未建联"];
   const selectedCampaignTask = useMemo(
     () => campaignTasks.find((task) => String(task.id) === selectedCampaignTaskId) || null,
     [campaignTasks, selectedCampaignTaskId]
   );
+  const businessCreators = useMemo(
+    () => items.filter((creator) => businessPoolStatuses.has(creator.poolStatus)),
+    [items]
+  );
   const poolCounts = useMemo(
     () =>
-      items.reduce<Record<string, number>>(
+      businessCreators.filter((creator) => platform === ALL || creator.platform === platform).reduce<Record<string, number>>(
         (acc, creator) => {
           acc[ALL] += 1;
           acc[creator.poolStatus] = (acc[creator.poolStatus] || 0) + 1;
@@ -101,13 +81,36 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
         },
         { [ALL]: 0 }
       ),
-    [items]
+    [businessCreators, platform]
+  );
+  const platformCounts = useMemo(() => ({
+    [ALL]: businessCreators.length,
+    抖音: businessCreators.filter((creator) => creator.platform === "抖音").length,
+    小红书: businessCreators.filter((creator) => creator.platform === "小红书").length
+  }), [businessCreators]);
+  const platformCreators = useMemo(
+    () => businessCreators.filter((creator) => platform === ALL || creator.platform === platform),
+    [businessCreators, platform]
+  );
+  const platformMetrics = useMemo(() => ({
+    total: platformCreators.length,
+    featured: platformCreators.filter((creator) => creator.poolStatus === "featured").length,
+    candidate: platformCreators.filter((creator) => creator.poolStatus === "candidate").length,
+    contacted: platformCreators.filter((creator) => creator.outreachStatus === "已建联").length
+  }), [platformCreators]);
+  const visibleCampaignTasks = useMemo(
+    () => campaignTasks.filter((task) => {
+      if (platform === ALL) return true;
+      const taskPlatform = /小红书|xhs/i.test(String(task.platform || "")) ? "小红书" : "抖音";
+      return taskPlatform === platform;
+    }),
+    [campaignTasks, platform]
   );
 
   const filteredCreators = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase();
 
-    return items.filter((creator) => {
+    return businessCreators.filter((creator) => {
       const matchesKeyword =
         !normalizedKeyword ||
         creator.name.toLowerCase().includes(normalizedKeyword) ||
@@ -117,17 +120,145 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
       const matchesPool = poolStatus === ALL || creator.poolStatus === poolStatus;
       const matchesPlatform = platform === ALL || creator.platform === platform;
       const matchesStatus = status === ALL || creator.outreachStatus === status;
-      const matchesGrade = grade === ALL || creator.grade === grade;
-      const matchesPriority = priority === ALL || creator.priority === priority;
-
-      return matchesKeyword && matchesPool && matchesPlatform && matchesStatus && matchesGrade && matchesPriority;
+      return matchesKeyword && matchesPool && matchesPlatform && matchesStatus;
     });
-  }, [grade, items, keyword, platform, poolStatus, priority, status]);
+  }, [businessCreators, keyword, platform, poolStatus, status]);
+
+  const selectableCreators = useMemo(
+    () => filteredCreators.filter((creator) => creator.poolStatus !== "skipped" && creator.outreachStatus === "未建联" && creator.profileUrl),
+    [filteredCreators]
+  );
+  const selectedCreators = useMemo(() => items.filter((creator) => selectedIds.includes(creator.id)), [items, selectedIds]);
+
+  function toggleCreator(creator: Creator) {
+    setError("");
+    setSelectedIds((current) => {
+      if (current.includes(creator.id)) return current.filter((id) => id !== creator.id);
+      if (current.length >= 5) {
+        setError("每批最多选择 5 位达人。");
+        return current;
+      }
+      setScripts((currentScripts) => ({
+        ...currentScripts,
+        [creator.id]: currentScripts[creator.id] || "您好，关注到您的内容很适合我们的合作方向，想了解一下近期的合作报价和档期，方便进一步沟通吗？"
+      }));
+      return [...current, creator.id];
+    });
+  }
+
+  function toggleVisibleCreators() {
+    const visibleIds = selectableCreators.slice(0, 5).map((creator) => creator.id);
+    const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+    setSelectedIds(allSelected ? [] : visibleIds);
+    if (!allSelected) {
+      setScripts((current) => {
+        const next = { ...current };
+        for (const creator of selectableCreators.slice(0, 5)) {
+          next[creator.id] ||= "您好，关注到您的内容很适合我们的合作方向，想了解一下近期的合作报价和档期，方便进一步沟通吗？";
+        }
+        return next;
+      });
+    }
+  }
+
+  function handleSent(creatorIds: string[]) {
+    const sent = new Set(creatorIds);
+    setItems((current) => current.map((creator) => (sent.has(creator.id) ? { ...creator, outreachStatus: "已建联" } : creator)));
+    setSelectedIds((current) => current.filter((id) => !sent.has(id)));
+  }
+
+  async function generateSelectedScripts() {
+    if (!selectedCreators.length) return {} as Record<string, string>;
+    setIsGenerating(true);
+    setOutreachSummary("");
+    let generated = 0;
+    const generatedScripts = { ...scripts };
+    await Promise.all(selectedCreators.map(async (creator) => {
+      setScriptStatus((current) => ({ ...current, [creator.id]: "正在生成个性化话术…" }));
+      try {
+        const response = await fetch("/api/outreach/script", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-kol-agent-id": window.localStorage.getItem("kol-crm-local-agent-id") || "" },
+          body: JSON.stringify({ creatorId: creator.id, taskKind: "initial", campaignTaskId: Number(selectedCampaignTaskId) || null, provider: "default" })
+        });
+        const result = await response.json().catch(() => ({})) as { script?: string; error?: string };
+        if (!response.ok || !result.script) throw new Error(result.error || "生成失败");
+        generatedScripts[creator.id] = result.script;
+        setScripts((current) => ({ ...current, [creator.id]: result.script! }));
+        setScriptStatus((current) => ({ ...current, [creator.id]: "话术已生成，可以继续编辑。" }));
+        generated += 1;
+      } catch (error) {
+        setScriptStatus((current) => ({ ...current, [creator.id]: error instanceof Error ? error.message : "生成失败，请重试。" }));
+      }
+    }));
+    setIsGenerating(false);
+    setOutreachSummary(`已生成 ${generated}/${selectedCreators.length} 人的话术。`);
+    return generatedScripts;
+  }
+
+  async function sendSelectedScripts(scriptValues: Record<string, string> = scripts) {
+    const sendable = selectedCreators.filter((creator) => creator.platform === "抖音" && scriptValues[creator.id]?.trim());
+    if (!sendable.length) {
+      setOutreachSummary("当前选中达人里没有可自动发送的抖音话术；小红书话术可复制后人工发送。");
+      return;
+    }
+    if (!window.confirm(`确认依次向 ${sendable.length} 位抖音达人发送私信吗？发送成功后将自动标记为已建联。`)) return;
+    setIsSending(true);
+    let sent = 0;
+    const successfulIds: string[] = [];
+    for (const creator of sendable) {
+      setScriptStatus((current) => ({ ...current, [creator.id]: "正在发送…" }));
+      try {
+        const response = await fetch("/api/outreach/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            creatorId: creator.id,
+            profileUrl: creator.profileUrl,
+            message: scriptValues[creator.id],
+            taskKind: "initial",
+            campaignTaskId: Number(selectedCampaignTaskId) || null
+          })
+        });
+        const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+        if (!response.ok || !result.ok) throw new Error(result.error || "发送失败");
+        sent += 1;
+        successfulIds.push(creator.id);
+        setScriptStatus((current) => ({ ...current, [creator.id]: "已发送并标记为已建联。" }));
+      } catch (error) {
+        setScriptStatus((current) => ({ ...current, [creator.id]: error instanceof Error ? error.message : "发送失败。" }));
+      }
+    }
+    setIsSending(false);
+    if (successfulIds.length) handleSent(successfulIds);
+    setOutreachSummary(`发送完成：成功 ${sent}/${sendable.length} 人。`);
+  }
+
+  async function generateAndSend() {
+    const generatedScripts = await generateSelectedScripts();
+    if (Object.keys(generatedScripts).length) await sendSelectedScripts(generatedScripts);
+  }
 
   function changeCampaignTask(taskId: string) {
     setSelectedCampaignTaskId(taskId);
-    const suffix = taskId ? `?campaignTaskId=${encodeURIComponent(taskId)}` : "";
-    window.location.href = `/creators${suffix}`;
+    const params = new URLSearchParams();
+    if (taskId) params.set("campaignTaskId", taskId);
+    if (platform === "抖音") params.set("platform", "douyin");
+    if (platform === "小红书") params.set("platform", "xhs");
+    window.location.href = `/creators${params.size ? `?${params.toString()}` : ""}`;
+  }
+
+  function changePlatform(nextPlatform: "全部" | "抖音" | "小红书") {
+    const currentTaskPlatform = selectedCampaignTask
+      ? (/小红书|xhs/i.test(String(selectedCampaignTask.platform || "")) ? "小红书" : "抖音")
+      : null;
+    const params = new URLSearchParams();
+    if (nextPlatform === "抖音") params.set("platform", "douyin");
+    if (nextPlatform === "小红书") params.set("platform", "xhs");
+    if (selectedCampaignTaskId && (nextPlatform === ALL || currentTaskPlatform === nextPlatform)) {
+      params.set("campaignTaskId", selectedCampaignTaskId);
+    }
+    window.location.href = `/creators${params.size ? `?${params.toString()}` : ""}`;
   }
 
   async function deleteCreator(creator: Creator) {
@@ -157,49 +288,11 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
       }
 
       setItems((current) => current.filter((item) => item.id !== creator.id));
+      setSelectedIds((current) => current.filter((id) => id !== creator.id));
     } catch {
       setError("删除接口没有响应，请确认本地服务还在运行。");
     } finally {
       setDeletingId(null);
-    }
-  }
-
-  async function sendToReview(creator: Creator) {
-    setReviewingId(creator.id);
-    setError("");
-
-    try {
-      const response = await fetch(`/api/creators/${encodeURIComponent(creator.id)}/review`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          reason: "Manual send to review: rules or human judgment changed.",
-          campaignTaskId: selectedCampaignTaskId || null
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        setError(data.error || "加入复筛失败。");
-        return;
-      }
-
-      setItems((current) =>
-        current.map((item) =>
-          item.id === creator.id
-            ? {
-                ...item,
-                poolStatus: "pending_review",
-                screeningStatus: "manual_recheck",
-                screeningSummary: data.creator?.screeningSummary || item.screeningSummary
-              }
-            : item
-        )
-      );
-    } catch {
-      setError("加入复筛接口没有响应，请确认本地服务还在运行。");
-    } finally {
-      setReviewingId(null);
     }
   }
 
@@ -247,130 +340,74 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
     }
   }
 
-  async function sendFilteredCandidatesToReview() {
-    const targets = filteredCreators.filter((creator) => creator.poolStatus === "candidate" || creator.poolStatus === "skipped");
-    if (!targets.length) {
-      setError("当前筛选结果里没有可加入复筛的待选库或已跳过达人。");
+  async function exportConnectedCreators() {
+    if (!exportFrom || !exportTo || exportFrom > exportTo) {
+      setError("请选择有效的建联日期范围。");
       return;
     }
-
-    const confirmed = window.confirm(`确定把当前筛选出的 ${targets.length} 个待选/已跳过达人加入复筛吗？`);
-    if (!confirmed) return;
-
-    setIsBatchReviewing(true);
     setError("");
-
+    setIsExporting(true);
     try {
-      const response = await fetch("/api/creators/review", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ids: targets.map((creator) => creator.id),
-          reason: "Batch send to review: rules or human judgment changed.",
-          campaignTaskId: selectedCampaignTaskId || null
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-
+      const exportParams = new URLSearchParams({ from: exportFrom, to: exportTo });
+      if (selectedCampaignTaskId) exportParams.set("campaignTaskId", selectedCampaignTaskId);
+      const response = await fetch(`/api/creators/export-connected?${exportParams.toString()}`);
       if (!response.ok) {
-        setError(data.error || "批量加入复筛失败。");
+        const result = await response.json().catch(() => ({})) as { error?: string };
+        setError(result.error || "导出失败，请重试。");
         return;
       }
-
-      const updatedIds = new Set<string>(data.ids || targets.map((creator) => creator.id));
-      setItems((current) =>
-        current.map((item) =>
-          updatedIds.has(item.id)
-            ? {
-                ...item,
-                poolStatus: "pending_review",
-                screeningStatus: "manual_recheck"
-              }
-            : item
-        )
-      );
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `已建联达人-${exportFrom}-${exportTo}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
     } catch {
-      setError("批量加入复筛接口没有响应，请确认本地服务还在运行。");
+      setError("导出接口没有响应，请确认服务正常运行。");
     } finally {
-      setIsBatchReviewing(false);
+      setIsExporting(false);
     }
-  }
-
-  function exportFeaturedCreators() {
-    const featuredCreators = items.filter((creator) => creator.poolStatus === "featured");
-    if (!featuredCreators.length) {
-      setError("当前没有精选库达人可以导出。");
-      return;
-    }
-
-    setError("");
-    const headers = [
-      "达人昵称",
-      "平台",
-      "主页链接",
-      "类目",
-      "粉丝",
-      "稳定播放",
-      "平均播放",
-      "报价",
-      "当前CPM",
-      "建议报价",
-      "评级",
-      "优先级",
-      "建联状态",
-      "筛选状态",
-      "筛选说明",
-      "备注"
-    ];
-    const rows = featuredCreators.map((creator) => [
-      creator.name,
-      creator.platform,
-      creator.profileUrl,
-      creator.category,
-      creator.fans,
-      creator.stablePlay,
-      creator.avgPlay,
-      creator.quote ?? "",
-      creator.currentCpm ?? "",
-      creator.suggestedPrice,
-      getGradeLabel(creator.grade),
-      getPriorityLabel(creator.priority),
-      creator.outreachStatus,
-      creator.screeningStatus,
-      creator.screeningSummary,
-      creator.notes
-    ]);
-    const csv = "\uFEFF" + [headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `达人精选库-${todayText()}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
   }
 
   return (
-    <>
+    <div className={`creator-library-shell ${platform === "小红书" ? "xhs-theme" : platform === "抖音" ? "douyin-theme" : "all-theme"}`}>
+      <section className={`platform-overview ${platform === "抖音" ? "douyin-active" : platform === "小红书" ? "xhs-active" : "all-active"}`}>
+        <div className="platform-switcher" aria-label="平台视图">
+          {([ALL, "抖音", "小红书"] as const).map((item) => (
+            <button aria-label={`切换到${item === ALL ? "全部" : item}平台`} className={platform === item ? "active" : ""} data-platform={item} key={item} onClick={() => changePlatform(item)} type="button">
+              <span className={`platform-logo ${item === "抖音" ? "douyin" : item === "小红书" ? "xhs" : "all"}`}>{item === ALL ? "全" : item === "抖音" ? "抖" : "红"}</span>
+              <span>{item === ALL ? "全部平台" : item}</span>
+              <strong>{platformCounts[item]}</strong>
+            </button>
+          ))}
+        </div>
+        <section className="metrics workflow-metrics platform-metrics">
+          <div><span>当前达人</span><strong>{platformMetrics.total}</strong></div>
+          <div><span>精选库</span><strong>{platformMetrics.featured}</strong></div>
+          <div><span>待选库</span><strong>{platformMetrics.candidate}</strong></div>
+          <div><span>已建联</span><strong>{platformMetrics.contacted}</strong></div>
+        </section>
+      </section>
       <section className="panel campaign-task-picker workflow-section workflow-primary-section">
         <div>
           <span className="workflow-kicker">01 · 当前视图</span>
           <h2>品类任务视图</h2>
-          <p>选择任务后，库类型会优先显示这个任务下的状态；不选任务则查看全局达人库。</p>
+          <p>选择任务后，库类型和建联状态都按这个任务独立显示；同一达人不会影响其他品类任务。</p>
         </div>
         <div className="campaign-task-picker-controls">
-          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={campaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="creators-brand-library" />
+          <BrandTaskPicker allowAll brandLibraries={initialBrandLibraries} campaignTasks={visibleCampaignTasks} onTaskChange={changeCampaignTask} selectedTaskId={selectedCampaignTaskId} storageKey="creators-brand-library" />
           <select hidden onChange={(event) => changeCampaignTask(event.target.value)} value={selectedCampaignTaskId}>
             <option value="">全局达人库</option>
-            {campaignTasks.map((task) => (
+            {visibleCampaignTasks.map((task) => (
               <option key={task.id} value={task.id}>
                 {task.name}
               </option>
             ))}
           </select>
-          <Link className="secondary-link" href="/agent">
+          <Link className="secondary-link workflow-manage-link" href="/agent">
             管理品类任务
           </Link>
         </div>
@@ -386,7 +423,7 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
             </div>
             <div>
               <span>当前达人</span>
-              <strong>{items.length} 个</strong>
+              <strong>{businessCreators.length} 个</strong>
             </div>
             <p>{selectedCampaignTask.targetDescription}</p>
           </div>
@@ -398,15 +435,17 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
           <div>
             <span className="workflow-kicker">02 · 库类型</span>
             <h2>库类型</h2>
-            <p>用样本/画像队列、待选库、精选库和已跳过区分不同阶段。明显不符合目标的达人可以直接删除。</p>
+            <p>画像通过后进入待选库，数据达到门槛后进入精选库；处理中间状态不在达人库展示。</p>
           </div>
           <div className="action-row">
-            <button className="secondary-button" disabled={isBatchReviewing} onClick={sendFilteredCandidatesToReview} type="button">
-              {isBatchReviewing ? "加入中..." : "一键去复筛"}
-            </button>
-            <button className="secondary-button" onClick={exportFeaturedCreators} type="button">
-              导出精选库
-            </button>
+            <div className="connected-export-control">
+              <label>建联开始日期<input max={exportTo} onChange={(event) => setExportFrom(event.target.value)} type="date" value={exportFrom} /></label>
+              <span>至</span>
+              <label>建联结束日期<input min={exportFrom} onChange={(event) => setExportTo(event.target.value)} type="date" value={exportTo} /></label>
+              <button className="secondary-button" disabled={isExporting} onClick={exportConnectedCreators} type="button">
+                {isExporting ? "导出中…" : "导出已建联达人 CSV"}
+              </button>
+            </div>
           </div>
         </div>
         <div className="topic-list">
@@ -430,36 +469,11 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
           <input onChange={(event) => setKeyword(event.target.value)} placeholder="达人昵称、类目、备注" value={keyword} />
         </label>
         <label>
-          平台
-          <select onChange={(event) => setPlatform(event.target.value)} value={platform}>
-            {platforms.map((item) => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          状态
+          {selectedCampaignTask ? "当前任务建联状态" : "全局建联状态"}
           <select onChange={(event) => setStatus(event.target.value)} value={status}>
             {statuses.map((item) => (
               <option key={item}>{item}</option>
             ))}
-          </select>
-        </label>
-        <label>
-          评级
-          <select onChange={(event) => setGrade(event.target.value)} value={grade}>
-            {[ALL, "S", "A", "B", "C", "D"].map((item) => (
-              <option key={item}>{item === ALL ? item : getGradeLabel(item)}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          优先级
-          <select onChange={(event) => setPriority(event.target.value)} value={priority}>
-            <option value={ALL}>全部</option>
-            <option value="high">优先</option>
-            <option value="medium">观察</option>
-            <option value="low">暂缓</option>
           </select>
         </label>
       </section>
@@ -472,61 +486,55 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
             <span className="workflow-kicker">03 · 达人明细</span>
             <h2>达人列表</h2>
             <p>
-              当前显示 {filteredCreators.length} / {items.length} 个达人。
+              当前显示 {filteredCreators.length} / {businessCreators.length} 个达人。
             </p>
+          </div>
+          <div className="action-row">
+            <button className="secondary-button" disabled={!selectableCreators.length} onClick={toggleVisibleCreators} type="button">
+              {selectableCreators.length > 0 && selectableCreators.slice(0, 5).every((creator) => selectedIds.includes(creator.id)) ? "取消选择" : "选择当前前5位"}
+            </button>
+            <strong>已选 {selectedIds.length}/5</strong>
           </div>
         </div>
         <div className="table-wrap">
-          <table>
+          <table className="creator-directory-table">
             <thead>
               <tr>
+                <th>选择</th>
                 <th>达人</th>
-                <th>库类型</th>
                 <th>平台</th>
+                <th>任务类别</th>
+                <th>库类型</th>
                 <th>建联状态</th>
-                <th>粉丝</th>
-                <th>稳定播放</th>
-                <th>报价</th>
-                <th>CPM</th>
-                <th>建议报价</th>
-                <th>评级</th>
-                <th>优先级</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody>
               {filteredCreators.map((creator) => (
-                <tr key={creator.id}>
-                  <td>
-                    <Link className="creator-link" href={`/creators/${creator.id}`}>
-                      {creator.name}
-                    </Link>
-                    <span>{creator.category}</span>
+                <Fragment key={creator.id}>
+                <tr className={selectedIds.includes(creator.id) ? "is-selected" : undefined}>
+                  <td className="creator-select-cell">
+                    <input
+                      aria-label={`选择 ${creator.name}`}
+                      checked={selectedIds.includes(creator.id)}
+                      disabled={creator.poolStatus === "skipped" || creator.outreachStatus === "已建联" || !creator.profileUrl}
+                      onChange={() => toggleCreator(creator)}
+                      type="checkbox"
+                    />
                   </td>
+                  <td className="creator-identity-cell">
+                    {creator.profileUrl ? <a className="creator-link" href={creator.profileUrl} rel="noreferrer" target="_blank">{creator.name}<span aria-hidden>↗</span></a> : <strong>{creator.name}</strong>}
+                    <Link className="creator-detail-link" href={`/creators/${creator.id}`}>查看资料</Link>
+                  </td>
+                  <td><span className={`platform-pill ${creator.platform === "小红书" ? "xhs" : "douyin"}`}>{creator.platform}</span></td>
+                  <td className="creator-task-cell">{creator.campaignTaskName || creator.category || "未分类"}</td>
                   <td>
                     <span className={`priority ${creator.poolStatus === "featured" ? "high" : creator.poolStatus === "candidate" ? "medium" : "low"}`}>
                       {getPoolLabel(creator.poolStatus)}
                     </span>
                   </td>
-                  <td>{creator.platform}</td>
-                  <td>{creator.outreachStatus}</td>
-                  <td>{formatNumber(creator.fans)}</td>
-                  <td>{formatNumber(creator.stablePlay)}</td>
-                  <td>{creator.quote ? `¥${formatNumber(creator.quote)}` : "-"}</td>
-                  <td className={creator.currentCpm && creator.currentCpm > 20 ? "danger" : ""}>{creator.currentCpm ?? "-"}</td>
-                  <td>¥{formatNumber(creator.suggestedPrice)}</td>
-                  <td>
-                    <span className={`grade grade-${creator.grade.toLowerCase()}`}>{getGradeLabel(creator.grade)}</span>
-                  </td>
-                  <td>
-                    <span className={`priority ${creator.priority}`}>{getPriorityLabel(creator.priority)}</span>
-                  </td>
-                  <td>
-                    {creator.poolStatus === "candidate" || creator.poolStatus === "skipped" ? (
-                      <button className="secondary-button" disabled={reviewingId === creator.id} onClick={() => sendToReview(creator)} type="button">
-                        {reviewingId === creator.id ? "加入中..." : "去复筛"}
-                      </button>
-                    ) : null}
+                  <td><span className={`outreach-status-pill ${creator.outreachStatus === "已建联" ? "connected" : "unconnected"}`}>{creator.outreachStatus}</span></td>
+                  <td><div className="creator-row-actions">
                     {creator.poolStatus === "featured" ? (
                       <button className="secondary-button" disabled={movingId === creator.id} onClick={() => moveToCandidate(creator)} type="button">
                         {movingId === creator.id ? "移动中..." : "移到待选库"}
@@ -535,13 +543,48 @@ export function CreatorLibrary({ creators, initialBrandLibraries, initialCampaig
                     <button className="secondary-button danger-button" disabled={deletingId === creator.id} onClick={() => deleteCreator(creator)} type="button">
                       {deletingId === creator.id ? "删除中..." : "删除"}
                     </button>
-                  </td>
+                  </div></td>
                 </tr>
+                {selectedIds.includes(creator.id) ? (
+                  <tr className="creator-inline-script-row">
+                    <td aria-hidden />
+                    <td colSpan={6}>
+                      <div className="creator-inline-script">
+                        <div className="creator-inline-script-heading">
+                          <strong>{creator.name} 的建联话术</strong>
+                          <span>{creator.platform === "抖音" ? "支持自动发送" : "小红书暂需复制后人工发送"}</span>
+                        </div>
+                        <textarea
+                          aria-label={`${creator.name} 的建联话术`}
+                          onChange={(event) => setScripts((current) => ({ ...current, [creator.id]: event.target.value }))}
+                          rows={3}
+                          value={scripts[creator.id] || ""}
+                        />
+                        <small>{scriptStatus[creator.id] || "可直接编辑，或点击下方批量生成 AI 话术。"}</small>
+                      </div>
+                    </td>
+                  </tr>
+                ) : null}
+                </Fragment>
               ))}
             </tbody>
           </table>
         </div>
       </section>
-    </>
+      {selectedCreators.length ? (
+        <div className="creator-selection-bar">
+          <div>
+            <strong>已选择 {selectedCreators.length}/5 人</strong>
+            <span>{outreachSummary || "话术已在对应达人行下方展开"}</span>
+          </div>
+          <div className="creator-selection-actions">
+            <button className="secondary-button" disabled={isGenerating || isSending} onClick={() => setSelectedIds([])} type="button">取消选择</button>
+            <button disabled={isGenerating || isSending} onClick={generateSelectedScripts} type="button">{isGenerating ? "生成中…" : "批量生成 AI 话术"}</button>
+            <button className="go-contact-button" disabled={isGenerating || isSending} onClick={() => sendSelectedScripts()} type="button">{isSending ? "发送中…" : "发送抖音话术"}</button>
+            <button className="go-contact-button" disabled={isGenerating || isSending} onClick={generateAndSend} type="button">一键生成并发送</button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }

@@ -6,6 +6,8 @@ import {
   type HomepageReviewRules
 } from "@/lib/douyin-homepage";
 import { prisma } from "@/lib/prisma";
+import { agentIdFromRequest } from "@/lib/central-agent-auth";
+import { withLocalAgentDevice } from "@/lib/local-agent-client";
 
 type BatchResult = {
   id: number;
@@ -107,6 +109,18 @@ function normalizeCampaignTaskId(value: unknown): number | null {
   return id;
 }
 
+// 小红书与抖音使用同一套状态语义，但互动门槛按平台体量缩放。
+// 后端也执行平台上限，避免旧页面或旧 Worker 把抖音阈值带入小红书任务。
+function platformScaledMetricRules(rules: HomepageReviewRules, candidate: DouyinDiscoveryCandidate): HomepageReviewRules {
+  const isXhs = candidate.platform === "小红书" || String(candidate.externalId || "").startsWith("xhs-");
+  if (!isXhs) return rules;
+  return {
+    ...rules,
+    avgLikesThreshold: Math.min(100, Number(rules.avgLikesThreshold ?? 100)),
+    viralLikesThreshold: Math.min(500, Number(rules.viralLikesThreshold ?? 500))
+  };
+}
+
 function toHomepageCampaignTask(task: any): HomepageReviewRules["campaignTask"] | undefined {
   if (!task) return undefined;
   return {
@@ -158,6 +172,10 @@ async function writeCampaignReviewResult(prisma: any, creatorId: number, campaig
 }
 
 export async function POST(request: NextRequest) {
+  return withLocalAgentDevice(agentIdFromRequest(request), () => handlePost(request));
+}
+
+async function handlePost(request: NextRequest) {
   if (!process.env.DATABASE_URL) {
     return NextResponse.json({ error: "还没有配置 DATABASE_URL，请先连接 MySQL。" }, { status: 400 });
   }
@@ -204,7 +222,9 @@ export async function POST(request: NextRequest) {
     const mode = body?.mode === "portrait" ? "portrait" : "metrics";
 
     if (mode === "metrics") {
-      const metricCandidates = candidates.map((candidate) => applyHomepageMetricRules(candidate, rules));
+      const metricCandidates = candidates.map((candidate) =>
+        applyHomepageMetricRules(candidate, platformScaledMetricRules(rules, candidate))
+      );
       const results: BatchResult[] = [];
       const existingLinks = campaignTaskId
         ? await prisma.creatorCampaignTask.findMany({
@@ -261,7 +281,7 @@ export async function POST(request: NextRequest) {
     }
 
     const reviewResults = await verifyDouyinHomepageCandidatesBatch(candidates, rules, {
-      workLimit: body?.workLimit || 10,
+      workLimit: body?.workLimit || 12,
       allowFullRetry: body?.allowFullRetry ?? true,
       skipObviousMismatch: body?.skipObviousMismatch ?? true
     });
@@ -275,6 +295,10 @@ export async function POST(request: NextRequest) {
       if (!result) {
         results.push({ id: row.id, externalId, name: row.name, ok: false, error: "没有拿到作品画像结果" });
         continue;
+      }
+
+      if (Number(result.fans || 0) > 0 && Number(result.fans) !== Number(row.fans || 0)) {
+        await prisma.creator.update({ where: { id: row.id }, data: { fans: Number(result.fans) } });
       }
 
       if (!result.ok) {
